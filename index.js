@@ -52,7 +52,7 @@ function randomColor() {
 }
 
 app.listen(3000, () => {
-  console.log('✅ SERVER RUNNING http://localhost:3000');
+  console.log('✅ SERVER RUNNING');
 });
 
 app.post('/room/:chatId/move', (req, res) => {
@@ -70,4 +70,12 @@ app.post('/room/:chatId/move', (req, res) => {
     room.currentTurn = currentTurn;
 
     res.json(room);
+});
+
+app.post('/room/:chatId/reset', (reg, res) => {
+    rooms[reg.params.chatId] = {
+        players: [],
+        currentTurn: 0
+    };
+    res.json({ ok: true });
 });
