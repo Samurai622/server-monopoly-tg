@@ -99,3 +99,18 @@ app.post('/room/:chatId/stop', (req, res) => {
 
   res.json({ok: true });
 })
+
+app.post('/room/:chatId/surrender', (req, res) => {
+  const { chatId } = req.params;
+  const { playerId } = req.body;
+
+  const room = rooms[chatId];
+  if(!room) return res.status(404).json({error: 'Room not found'});
+
+  room.players = room.players.filter(p => p.id !== playerId);
+
+  if(room.currentTurn >= room.players.length) {
+    room.currentTurn = 0;
+  }
+  res.json(room);
+})
