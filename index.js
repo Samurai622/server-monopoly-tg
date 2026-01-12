@@ -20,7 +20,8 @@ app.post('/room/:chatId/join', (req, res) => {
   if (!rooms[chatId]) {
     rooms[chatId] = {
       players: [],
-      currentTurn: 0
+      currentTurn: 0,
+      active: true
     };
   }
 
@@ -83,7 +84,8 @@ app.post('/room/:chatId/move', (req, res) => {
 app.post('/room/:chatId/reset', (reg, res) => {
     rooms[reg.params.chatId] = {
         players: [],
-        currentTurn: 0
+        currentTurn: 0,
+        active: false
     };
     res.json({ ok: true });
 });
