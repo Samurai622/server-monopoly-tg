@@ -33,7 +33,8 @@ app.post('/room/:chatId/join', (req, res) => {
       name,
       pos: 0,
       money: 1500,
-      color: randomColor()
+      color: randomColor(),
+      active: true
     });
   }
 
@@ -107,10 +108,19 @@ app.post('/room/:chatId/surrender', (req, res) => {
   const room = rooms[chatId];
   if(!room) return res.status(404).json({error: 'Room not found'});
 
-  room.players = room.players.filter(p => p.id !== playerId);
+  const player = room.players.find(p => p.id === playerId);
+  if(!player) return res.status(404).json({error: 'Player not found' });
 
-  if(room.currentTurn >= room.players.length) {
-    room.currentTurn = 0;
+  player.active = false;
+  player.color = 'gray';
+
+  if(room.players[room.currentTurn].id === playerId) {
+    let next = (room.currentTurn + 1) % room.players.length;
+    while (!room.players[next].active) {
+      next = (next + 1) & room.players.length;
+    }
+    room.currentTurn = next;
   }
+
   res.json(room);
 })
