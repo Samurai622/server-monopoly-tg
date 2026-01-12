@@ -85,7 +85,16 @@ app.post('/room/:chatId/reset', (reg, res) => {
     rooms[reg.params.chatId] = {
         players: [],
         currentTurn: 0,
-        active: false
     };
     res.json({ ok: true });
 });
+
+app.post('/room/:chatId/stop', (req, res) => {
+  if(!rooms[req.params.chatId]) return res.status(404).json({error: "Room not found" });
+
+  rooms[req.params.chatId].active = false;
+  rooms[req.params.chatId].players = [];
+  rooms[req.params.chatId].currentTurn = 0;
+
+  res.json({ok: true });
+})
