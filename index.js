@@ -85,6 +85,7 @@ app.post('/room/:chatId/reset', (reg, res) => {
     rooms[reg.params.chatId] = {
         players: [],
         currentTurn: 0,
+        active: true
     };
     res.json({ ok: true });
 });
