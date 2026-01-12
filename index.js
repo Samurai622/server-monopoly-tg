@@ -56,21 +56,29 @@ app.listen(3000, () => {
 });
 
 app.post('/room/:chatId/move', (req, res) => {
-    const { chatId } = req.params;
-    const { playerId, pos, money, currentTurn } = req.body;
+  const { chatId } = req.params;
+  const { playerId, steps } = req.body;
 
-    const room = rooms[chatId];
-    if (!room) return res.status(404).json({ error: 'Room not found' });
+  const room = rooms[chatId];
+  if (!room) return res.status(404).json({ error: 'Room not found' });
 
-    const player = room.players.find(p => p.id === playerId);
-    if(!player) return res.status(404).json({ error: 'Player not found' });
+  const playerIndex = room.players.findIndex(p => p.id === playerId);
+  if (playerIndex === -1)
+    return res.status(404).json({ error: 'Player not found' });
 
-    player.pos = pos;
-    player.money = money;
-    room.currentTurn = currentTurn;
+  if (playerIndex !== room.currentTurn)
+    return res.status(403).json({ error: 'Not your turn' });
 
-    res.json(room);
+  const player = room.players[playerIndex];
+
+  for (let i = 0; i < steps; i++) {
+    player.pos = (player.pos + 1) % 40;
+  }
+
+  room.currentTurn = (room.currentTurn + 1) % room.players.length;
+  res.json(room);
 });
+
 
 app.post('/room/:chatId/reset', (reg, res) => {
     rooms[reg.params.chatId] = {
