@@ -117,9 +117,14 @@ app.post('/room/:chatId/surrender', (req, res) => {
   if(room.players[room.currentTurn].id === playerId) {
     let next = (room.currentTurn + 1) % room.players.length;
     while (!room.players[next].active) {
-      next = (next + 1) & room.players.length;
+      next = (next + 1) % room.players.length;
     }
     room.currentTurn = next;
+  }
+
+  const activePlayers = room.players.filter(p => p.active);
+  if(activePlayers.length === 1) {
+    room.active = false;
   }
 
   res.json(room);
