@@ -49,7 +49,7 @@ app.get('/room/:chatId', (req, res) => {
 });
 
 function randomColor() {
-  const colors = ['red','blue','green','yellow','purple','cyan'];
+  const colors = ['red','green','yellow','purple','orange','brown'];
   return colors[Math.floor(Math.random() * colors.length)];
 }
 
