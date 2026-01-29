@@ -1,4 +1,4 @@
-import { pool } from './db.js';
+const { pool } = require('./db.js');
 
 pool.query('SELECT 1')
   .then(() => console.log('✅ DATABASE CONNECTED'))
