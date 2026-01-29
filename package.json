@@ -1,14 +1,15 @@
 {
   "name": "monopoly-server",
   "version": "1.0.0",
-  "type": "commonjs",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.22.1"
+    "express": "^4.22.1",
+    "pg": "^8.17.2"
   },
   "description": "",
   "keywords": [],
