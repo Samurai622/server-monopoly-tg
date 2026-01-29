@@ -1,3 +1,9 @@
+import { pool } from './db.js';
+
+pool.query('SELECT 1')
+  .then(() => console.log('✅ DATABASE CONNECTED'))
+  .catch(err => console.error('❌ DATABASE CONNECTION ERROR:', err));
+
 const express = require('express');
 const cors = require('cors');
 
