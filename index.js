@@ -139,7 +139,7 @@ app.post('/room/:chatId/move', async (req, res) => {
       return res.status(403).json({ error: 'Not your turn' });
     }
 
-    const newPos = (currentPlayer.position + st) % 40;
+    const newPos = (currentPlayer.pos + st) % 40;
 
     await client.query(
       `UPDATE players SET pos=$1 WHERE id=$2`,
