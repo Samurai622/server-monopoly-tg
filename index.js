@@ -74,7 +74,7 @@ app.get('/room/:chatId/state', async (req, res) => {
       active
     FROM players
     WHERE room_id=$1
-    ORDER BY id`,
+    ORDER BY players.id`,
     [room.id]
   );
   res.json({
@@ -98,7 +98,7 @@ app.post('/room/:chatId/move', async (req, res) => {
   const { playerId, steps } = req.body;
   const pid = Number(playerId);
   const st = Number(steps);
-  if(!Number.isFinite(pid) || !Number.isFinite(st) || st < 0 || st > 12) {
+  if(!Number.isFinite(pid) || !Number.isFinite(st) || st < 2 || st > 12) {
     return res.status(400).json({ error: 'Bad request data' });
   }
   const client = await pool.connect();
@@ -124,7 +124,7 @@ app.post('/room/:chatId/move', async (req, res) => {
       `SELECT id, tg_id, pos
       FROM players
       WHERE room_id=$1 AND active=true
-      ORDER BY id
+      ORDER BY players.id
       FOR UPDATE`,
       [room.id]
     );
@@ -139,7 +139,7 @@ app.post('/room/:chatId/move', async (req, res) => {
       return res.status(403).json({ error: 'Not your turn' });
     }
 
-    const newPos = (currentPlayer.pos + st) % 40;
+    const newPos = (Number(currentPlayer.pos) + st) % 40;
 
     await client.query(
       `UPDATE players SET pos=$1 WHERE id=$2`,
