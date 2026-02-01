@@ -40,7 +40,7 @@ app.post('/room/:chatId/join', async (req, res) => {
 
   if(!exists.rows.length) {
     await pool.query(
-      `INSERT INTO players (room_id, tg_id, name, position, money, color, active)
+      `INSERT INTO players (room_id, tg_id, name, pos, money, color, active)
       VALUES ($1, $2, $3, 0, 1500, $4, true)`,
       [roomId, tgId, name, randomColor()]
     );
@@ -68,7 +68,7 @@ app.get('/room/:chatId/state', async (req, res) => {
     `SELECT
       tg_id AS id,
       name,
-      position AS pos,
+      pos AS pos,
       money,
       color,
       active
@@ -121,7 +121,7 @@ app.post('/room/:chatId/move', async (req, res) => {
     const room = roomRes.rows[0];
 
     const playersRes = await client.query(
-      `SELECT id, tg_id, position
+      `SELECT id, tg_id, pos
       FROM players
       WHERE room_id=$1 AND active=true
       ORDER BY id
@@ -142,7 +142,7 @@ app.post('/room/:chatId/move', async (req, res) => {
     const newPos = (currentPlayer.position + st) % 40;
 
     await client.query(
-      `UPDATE players SET position=$1 WHERE id=$2`,
+      `UPDATE players SET pos=$1 WHERE id=$2`,
       [newPos, currentPlayer.id]
     );
 
