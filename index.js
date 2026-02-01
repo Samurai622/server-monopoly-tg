@@ -11,47 +11,77 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const rooms = {}; // { chatId: { players: [], currentTurn: 0 } }
-
 // тест
 app.get('/', (req, res) => {
   res.send('SERVER OK');
 });
 
 // 👉 приєднатись до кімнати
-app.post('/room/:chatId/join', (req, res) => {
+app.post('/room/:chatId/join', async (req, res) => {
   const { chatId } = req.params;
   const { id, name } = req.body;
+  const tgId = Number(id);
 
-  if (!rooms[chatId]) {
-    rooms[chatId] = {
-      players: [],
-      currentTurn: 0,
-      active: true
-    };
+  const roomRes = await pool.query(
+    `SELECT id FROM rooms WHERE chat_id=$1 AND active=true`,
+    [chatId]
+  );
+ 
+  if (!roomRes.rows.length) {
+    return res.status(404).json({ error: 'Room not found or inactive' });
   }
 
-  const room = rooms[chatId];
+  const roomId = roomRes.rows[0].id;
 
-  if (!room.players.find(p => p.id === id)) {
-    room.players.push({
-      id,
-      name,
-      pos: 0,
-      money: 1500,
-      color: randomColor(),
-      active: true
-    });
+  const exists = await pool.query(
+    `SELECT 1 FROM players WHERE room_id=$1 AND tg_id=$2`,
+    [roomId, tgId]
+  );
+
+  if(!exists.rows.length) {
+    await pool.query(
+      `INSERT INTO players (room_id, tg_id, name, position, money, color, active)
+      VALUES ($1, $2, $3, 0, 1500, $4, true)`,
+      [roomId, tgId, name, randomColor()]
+    );
   }
 
-  res.json(room);
+  res.json({ ok: true });
 });
 
 // 👉 отримати стан кімнати
-app.get('/room/:chatId', (req, res) => {
-  const room = rooms[req.params.chatId];
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  res.json(room);
+app.get('/room/:chatId/state', async (req, res) => {
+  const { chatId } = req.params;
+
+  const roomRes = await pool.query(
+    `SELECT * FROM rooms WHERE chat_id=$1 AND active=true`,
+    [chatId]
+  );
+  
+  if(!roomRes.rows.length) {
+    return res.status(404).json({ error: 'GAME_NOT_FOUND' });
+  }
+
+  const room = roomRes.rows[0];
+
+  const playersRes = await pool.query(
+    `SELECT
+      tg_id AS id,
+      name,
+      position AS pos,
+      money,
+      color,
+      active
+    FROM players
+    WHERE room_id=$1
+    ORDER BY id`,
+    [room.id]
+  );
+  res.json({
+    active: room.active,
+    currentTurn: room.current_turn,
+    players: playersRes.rows
+  });
 });
 
 function randomColor() {
@@ -63,75 +93,72 @@ app.listen(3000, () => {
   console.log('✅ SERVER RUNNING');
 });
 
-app.post('/room/:chatId/move', (req, res) => {
+app.post('/room/:chatId/move', async (req, res) => {
   const { chatId } = req.params;
   const { playerId, steps } = req.body;
-
-  const room = rooms[chatId];
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-
-  const playerIndex = room.players.findIndex(p => p.id === playerId);
-  if (playerIndex === -1)
-    return res.status(404).json({ error: 'Player not found' });
-
-  if (playerIndex !== room.currentTurn)
-    return res.status(403).json({ error: 'Not your turn' });
-
-  const player = room.players[playerIndex];
-
-  for (let i = 0; i < steps; i++) {
-    player.pos = (player.pos + 1) % 40;
+  const pid = Number(playerId);
+  const st = Number(steps);
+  if(!Number.isFinite(pid) || !Number.isFinite(st) || st < 0 || st > 12) {
+    return res.status(400).json({ error: 'Bad request data' });
   }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const roomRes = await client.query(
+      `SELECT id, current_turn 
+      FROM rooms 
+      WHERE chat_id=$1 AND active=true
+      FOR UPDATE`,
+      [chatId]
+    );
 
-  room.currentTurn = (room.currentTurn + 1) % room.players.length;
-  res.json(room);
-});
-
-
-app.post('/room/:chatId/reset', (reg, res) => {
-    rooms[reg.params.chatId] = {
-        players: [],
-        currentTurn: 0,
-        active: true
-    };
-    res.json({ ok: true });
-});
-
-app.post('/room/:chatId/stop', (req, res) => {
-  if(!rooms[req.params.chatId]) return res.status(404).json({error: "Room not found" });
-
-  rooms[req.params.chatId].active = false;
-  rooms[req.params.chatId].players = [];
-  rooms[req.params.chatId].currentTurn = 0;
-
-  res.json({ok: true });
-})
-
-app.post('/room/:chatId/surrender', (req, res) => {
-  const { chatId } = req.params;
-  const { playerId } = req.body;
-
-  const room = rooms[chatId];
-  if(!room) return res.status(404).json({error: 'Room not found'});
-
-  const player = room.players.find(p => p.id === playerId);
-  if(!player) return res.status(404).json({error: 'Player not found' });
-
-  player.active = false;
-  player.color = 'gray';
-
-  if(room.players[room.currentTurn].id === playerId) {
-    let next = (room.currentTurn + 1) % room.players.length;
-    while (!room.players[next].active) {
-      next = (next + 1) % room.players.length;
+    if (!roomRes.rows.length){
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Room not found' });
     }
-    room.currentTurn = next;
-  }
 
-  const activePlayers = room.players.filter(p => p.active);
-  if(activePlayers.length === 1) {
-    room.active = false;
-  }
+    const room = roomRes.rows[0];
 
-  res.json(room);
-})
+    const playersRes = await client.query(
+      `SELECT id, tg_id, position
+      FROM players
+      WHERE room_id=$1 AND active=true
+      ORDER BY id
+      FOR UPDATE`,
+      [room.id]
+    );
+    if(playersRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No active players' });
+    }
+    
+    const currentPlayer = playersRes.rows[room.current_turn];
+    if(!currentPlayer || currentPlayer.tg_id !== pid) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Not your turn' });
+    }
+
+    const newPos = (currentPlayer.position + st) % 40;
+
+    await client.query(
+      `UPDATE players SET position=$1 WHERE id=$2`,
+      [newPos, currentPlayer.id]
+    );
+
+    const nextTurn = (room.current_turn + 1) % playersRes.rows.length;
+
+    await client.query(
+      `UPDATE rooms SET current_turn=$1 WHERE id=$2`,
+      [nextTurn, room.id]
+    );
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
