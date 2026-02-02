@@ -68,13 +68,13 @@ app.get('/room/:chatId/state', async (req, res) => {
     `SELECT
       tg_id AS id,
       name,
-      pos AS pos,
+      pos,
       money,
       color,
       active
     FROM players
     WHERE room_id=$1
-    ORDER BY players.id`,
+    ORDER BY turn_order`,
     [room.id]
   );
   res.json({
@@ -89,9 +89,8 @@ function randomColor() {
   return colors[Math.floor(Math.random() * colors.length)];
 }
 
-app.listen(3000, () => {
-  console.log('✅ SERVER RUNNING');
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
 
 app.post('/room/:chatId/move', async (req, res) => {
   const { chatId } = req.params;
@@ -122,17 +121,23 @@ app.post('/room/:chatId/move', async (req, res) => {
 
     const playersRes = await client.query(
       `SELECT id, tg_id, pos
-      FROM players
-      WHERE room_id=$1 AND active=true
-      ORDER BY players.id
-      FOR UPDATE`,
+       FROM players
+       WHERE room_id=$1 AND active=true
+       ORDER BY turn_order
+       FOR UPDATE`,
       [room.id]
     );
     if(playersRes.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'No active players' });
     }
-    
+    console.log("MOVE DEBUG:", {
+      chatId,
+      pid,
+      roomId: room.id,
+      current_turn: room.current_turn,
+      players_order: playersRes.rows.map(p => ({pid: p.id, tg: p.tg_id, pos: p.pos}))
+    });
     const currentPlayer = playersRes.rows[room.current_turn];
     if(!currentPlayer || currentPlayer.tg_id !== pid) {
       await client.query('ROLLBACK');
