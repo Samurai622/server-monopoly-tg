@@ -146,7 +146,7 @@ app.post('/room/:chatId/move', async (req, res) => {
       current_turn: room.current_turn
     });
 
-    if(!currentPlayer || currentPlayer.tg_id !== pid) {
+    if(!currentPlayer || String(currentPlayer.tg_id) !== String(pid)) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not your turn' });
     }
