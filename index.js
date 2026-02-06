@@ -139,6 +139,13 @@ app.post('/room/:chatId/move', async (req, res) => {
       players_order: playersRes.rows.map(p => ({pid: p.id, tg: p.tg_id, pos: p.pos}))
     });
     const currentPlayer = playersRes.rows[room.current_turn];
+
+    console.log("TURN CHECK", {
+      pid, pidType: typeof pid,
+      curTg: currentPlayer?.tg_id, curType: typeof currentPlayer?.tg_id,
+      current_turn: room.current_turn
+    });
+
     if(!currentPlayer || currentPlayer.tg_id !== pid) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not your turn' });
