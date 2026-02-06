@@ -20,7 +20,7 @@ app.get('/', (req, res) => {
 app.post('/room/:chatId/join', async (req, res) => {
   const { chatId } = req.params;
   const { id, name } = req.body;
-  const tgId = Number(id);
+  const tgId = String(id);
 
   const roomRes = await pool.query(
     `SELECT id FROM rooms WHERE chat_id=$1 AND active=true`,
@@ -31,21 +31,22 @@ app.post('/room/:chatId/join', async (req, res) => {
     return res.status(404).json({ error: 'Room not found or inactive' });
   }
 
-  const roomId = roomRes.rows[0].id;
+  const room = roomRes.rows[0];
+  if(room.status !== 'waiting') return res.status(403).json({ error: 'Game already started' });
 
-  const exists = await pool.query(
-    `SELECT 1 FROM players WHERE room_id=$1 AND tg_id=$2`,
-    [roomId, tgId]
+  const countRes = await pool.query(`SELECT COUNT(*) FROM players WHERE room_id=$1`, [room.id]);
+  if(+countRes.rows[0].count >= 6) return res.status(403).json({ error: 'Room is full' });
+
+  await pool.query(
+    `INSERT INTO players (room_id, tg_id, name, pos, money, color, active)
+    VALUES ($1, $2, $3, 0, 1500, $4, true)
+    ON CONFLICT (tg_id, room_id)
+    DO UPDATE SET
+      name = EXCLUDED.name,
+      active = true,`
+    [room.id, tgId, name, randomColor()]
   );
-
-  if(!exists.rows.length) {
-    await pool.query(
-      `INSERT INTO players (room_id, tg_id, name, pos, money, color, active)
-      VALUES ($1, $2, $3, 0, 1500, $4, true)`,
-      [roomId, tgId, name, randomColor()]
-    );
-  }
-
+  
   res.json({ ok: true });
 });
 
