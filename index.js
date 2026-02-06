@@ -46,7 +46,7 @@ app.post('/room/:chatId/join', async (req, res) => {
       active = true,`
     [room.id, tgId, name, randomColor()]
   );
-  
+
   res.json({ ok: true });
 });
 
@@ -75,7 +75,7 @@ app.get('/room/:chatId/state', async (req, res) => {
       active
     FROM players
     WHERE room_id=$1
-    ORDER BY turn_order`,
+    ORDER BY turn_order NULL LAST, id`,
     [room.id]
   );
   res.json({
@@ -124,7 +124,7 @@ app.post('/room/:chatId/move', async (req, res) => {
       `SELECT id, tg_id, pos
        FROM players
        WHERE room_id=$1 AND active=true
-       ORDER BY turn_order
+       ORDER BY turn_order NULL LAST, id
        FOR UPDATE`,
       [room.id]
     );
