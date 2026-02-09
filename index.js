@@ -6,6 +6,7 @@ pool.query('SELECT 1')
 
 const express = require('express');
 const cors = require('cors');
+const { act } = require('react');
 
 const app = express();
 app.use(cors());
@@ -34,7 +35,7 @@ app.post('/room/:chatId/join', async (req, res) => {
   const room = roomRes.rows[0];
   if(room.status !== 'waiting') return res.status(403).json({ error: 'Game already started' });
 
-  const countRes = await pool.query(`SELECT COUNT(*) FROM players WHERE room_id=$1`, [room.id]);
+  const countRes = await pool.query(`SELECT COUNT(*) FROM players WHERE room_id=$1 AND active=true`, [room.id]);
   if(+countRes.rows[0].count >= 6) return res.status(403).json({ error: 'Room is full' });
 
   await pool.query(
@@ -78,9 +79,23 @@ app.get('/room/:chatId/state', async (req, res) => {
     ORDER BY turn_order NULLS LAST, id`,
     [room.id]
   );
+  
+  const activeRes = await pool.query(
+    `SELECT tg_id::text AS id
+    FROM players
+    WHERE room_id=$1 AND active=true
+    ORDER BY turn_order NULLS LAST, id`,
+    [room.id]
+  );
+
+  const activeCount = activeRes.rows.length;
+  const turnIndex = activeCount ? room.current_turn % activeCount : 0;
+  const currentTurnId = activeCount ? activeRes.rows[turnIndex]?.id : null;
+
   res.json({
     active: room.active,
     currentTurn: room.current_turn,
+    currentTurnId,
     players: playersRes.rows
   });
 });
@@ -173,5 +188,105 @@ app.post('/room/:chatId/move', async (req, res) => {
     client.release();
   }
 });
+
+app.post('/room/:chatId/surrender', async (req, res) => {
+  const { chatId } = req.params;
+  const pid = String(req.body.playerId);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const roomRes = await client.query(
+      `SELECT id, current_turn, status
+      FROM rooms
+      WHERE chat_id=$1 AND active=true
+      FOR UPDATE`,
+      [chatId]
+    );
+
+    if(!roomRes.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    const room = roomRes.rows[0];
+    if(room.status !== 'playing') {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Game not in progress' });
+    }
+
+    const playersRes = await client.query (
+      `SELECT id, tg_id
+      FROM players
+      WHERE room_id=$1 AND active=true
+      ORDER BY turn_order NULLS LAST, id
+      FOR UPDATE`,
+      [room.id]
+    );
+
+    if(playersRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No active players' });
+    }
+
+    const idx = playersRes.rows.findIndex(p => String(p.tg_id) === pid);
+    if(idx === -1) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Player not in game' });
+    }
+
+    const up = await client.query(
+      `UPDATE players
+      SET active=false
+      WHERE room_id=$1 AND tg_id=$2 AND active=true
+      RETURNING id`,
+      [room.id, pid]
+    );
+
+    if(!up.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Player not active' });
+    }
+
+    const leftRes = await client.query(
+      `SELECT tg_id
+      FROM players
+      WHERE room_id=$1 AND active=true
+      ORDER BY turn_order NULLS LAST, id`,
+      [room.id]
+    );
+
+    if(leftRes.rows.length <= 1) {
+      await client.query(
+        `UPDATE rooms SET status='stopped', active=false WHERE id=$1`,
+        [room.id]
+      );
+      await client.query('COMMIT');
+      return res.json({ ok: true, gameEnded: true });
+    }
+
+    let turnIndex = room.current_turn % playersRes.rows.length;
+    let newTurn = turnIndex;
+    if(idx <turnIndex) newTurn = turnIndex - 1;
+    if(idx === turnIndex) newTurn = turnIndex;
+
+    newTurn = newTurn % leftRes.rows.length;
+
+    await client.query(
+      `UPDATE rooms SET current_turn=$1 WHERE id=$2`,
+      [newTurn, room.id]
+    );
+    
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
