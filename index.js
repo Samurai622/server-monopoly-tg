@@ -6,7 +6,6 @@ pool.query('SELECT 1')
 
 const express = require('express');
 const cors = require('cors');
-const { act } = require('react');
 
 const app = express();
 app.use(cors());
