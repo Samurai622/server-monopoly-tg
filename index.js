@@ -23,7 +23,7 @@ app.post('/room/:chatId/join', async (req, res) => {
   const tgId = String(id);
 
   const roomRes = await pool.query(
-    `SELECT id FROM rooms WHERE chat_id=$1 AND active=true`,
+    `SELECT id, status FROM rooms WHERE chat_id=$1 AND active=true`,
     [chatId]
   );
  
@@ -40,10 +40,10 @@ app.post('/room/:chatId/join', async (req, res) => {
   await pool.query(
     `INSERT INTO players (room_id, tg_id, name, pos, money, color, active)
     VALUES ($1, $2, $3, 0, 1500, $4, true)
-    ON CONFLICT (tg_id, room_id)
+    ON CONFLICT (room_id, tg_id)
     DO UPDATE SET
       name = EXCLUDED.name,
-      active = true,`
+      active = true`,
     [room.id, tgId, name, randomColor()]
   );
 
@@ -67,7 +67,7 @@ app.get('/room/:chatId/state', async (req, res) => {
 
   const playersRes = await pool.query(
     `SELECT
-      tg_id AS id,
+      tg_id::text AS id,
       name,
       pos,
       money,
@@ -75,7 +75,7 @@ app.get('/room/:chatId/state', async (req, res) => {
       active
     FROM players
     WHERE room_id=$1
-    ORDER BY turn_order NULL LAST, id`,
+    ORDER BY turn_order NULLS LAST, id`,
     [room.id]
   );
   res.json({
@@ -90,23 +90,22 @@ function randomColor() {
   return colors[Math.floor(Math.random() * colors.length)];
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
-
 app.post('/room/:chatId/move', async (req, res) => {
   const { chatId } = req.params;
   const { playerId, steps } = req.body;
-  const pid = Number(playerId);
+  const pid = String(playerId);
   const st = Number(steps);
-  if(!Number.isFinite(pid) || !Number.isFinite(st) || st < 2 || st > 12) {
+
+  if(!Number.isFinite(st) || st < 2 || st > 12) {
     return res.status(400).json({ error: 'Bad request data' });
   }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     
     const roomRes = await client.query(
-      `SELECT id, current_turn 
+      `SELECT id, current_turn, status
       FROM rooms 
       WHERE chat_id=$1 AND active=true
       FOR UPDATE`,
@@ -119,12 +118,16 @@ app.post('/room/:chatId/move', async (req, res) => {
     }
 
     const room = roomRes.rows[0];
+    if(room.status !== 'playing') {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Game not in progress' });
+    }
 
     const playersRes = await client.query(
       `SELECT id, tg_id, pos
        FROM players
        WHERE room_id=$1 AND active=true
-       ORDER BY turn_order NULL LAST, id
+       ORDER BY turn_order NULLS LAST, id
        FOR UPDATE`,
       [room.id]
     );
@@ -132,6 +135,12 @@ app.post('/room/:chatId/move', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'No active players' });
     }
+    const me = playersRes.rows.find(p => String(p.tg_id) === pid);
+    if(!me) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Player not in game' });
+    }
+
     console.log("MOVE DEBUG:", {
       chatId,
       pid,
@@ -139,7 +148,8 @@ app.post('/room/:chatId/move', async (req, res) => {
       current_turn: room.current_turn,
       players_order: playersRes.rows.map(p => ({pid: p.id, tg: p.tg_id, pos: p.pos}))
     });
-    const currentPlayer = playersRes.rows[room.current_turn];
+    const turnIndex = room.current_turn % playersRes.rows.length;
+    const currentPlayer = playersRes.rows[turnIndex];
 
     console.log("TURN CHECK", {
       pid, pidType: typeof pid,
@@ -147,7 +157,7 @@ app.post('/room/:chatId/move', async (req, res) => {
       current_turn: room.current_turn
     });
 
-    if(!currentPlayer || String(currentPlayer.tg_id) !== String(pid)) {
+    if(!currentPlayer || String(currentPlayer.tg_id) !== pid) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not your turn' });
     }
@@ -159,7 +169,7 @@ app.post('/room/:chatId/move', async (req, res) => {
       [newPos, currentPlayer.id]
     );
 
-    const nextTurn = (room.current_turn + 1) % playersRes.rows.length;
+    const nextTurn = (turnIndex + 1) % playersRes.rows.length;
 
     await client.query(
       `UPDATE rooms SET current_turn=$1 WHERE id=$2`,
@@ -175,3 +185,5 @@ app.post('/room/:chatId/move', async (req, res) => {
     client.release();
   }
 });
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
