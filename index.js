@@ -141,21 +141,9 @@ app.post('/room/:chatId/move', async (req, res) => {
       return res.status(403).json({ error: 'Player not in game' });
     }
 
-    console.log("MOVE DEBUG:", {
-      chatId,
-      pid,
-      roomId: room.id,
-      current_turn: room.current_turn,
-      players_order: playersRes.rows.map(p => ({pid: p.id, tg: p.tg_id, pos: p.pos}))
-    });
     const turnIndex = room.current_turn % playersRes.rows.length;
     const currentPlayer = playersRes.rows[turnIndex];
 
-    console.log("TURN CHECK", {
-      pid, pidType: typeof pid,
-      curTg: currentPlayer?.tg_id, curType: typeof currentPlayer?.tg_id,
-      current_turn: room.current_turn
-    });
 
     if(!currentPlayer || String(currentPlayer.tg_id) !== pid) {
       await client.query('ROLLBACK');
