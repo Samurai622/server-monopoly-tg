@@ -55,7 +55,7 @@ app.get('/room/:chatId/state', async (req, res) => {
   const { chatId } = req.params;
 
   const roomRes = await pool.query(
-    `SELECT * FROM rooms WHERE chat_id=$1 AND active=true`,
+    `SELECT * FROM rooms WHERE chat_id=$1`,
     [chatId]
   );
   
@@ -80,12 +80,17 @@ app.get('/room/:chatId/state', async (req, res) => {
   );
   
   const activeRes = await pool.query(
-    `SELECT tg_id::text AS id
+    `SELECT tg_id::text AS id, name
     FROM players
     WHERE room_id=$1 AND active=true
     ORDER BY turn_order NULLS LAST, id`,
     [room.id]
   );
+
+  let winnerName = null;
+  if (room.status === 'stopped' && activeRes.rows.length === 1) {
+    winnerName = activeRes.rows[0].name;
+  }
 
   const activeCount = activeRes.rows.length;
   const turnIndex = activeCount ? room.current_turn % activeCount : 0;
@@ -93,6 +98,8 @@ app.get('/room/:chatId/state', async (req, res) => {
 
   res.json({
     active: room.active,
+    status: room.status,
+    winnerName,
     currentTurn: room.current_turn,
     currentTurnId,
     players: playersRes.rows
@@ -236,11 +243,12 @@ app.post('/room/:chatId/surrender', async (req, res) => {
 
     const up = await client.query(
       `UPDATE players
-      SET active=false
+      SET active=false, money=0
       WHERE room_id=$1 AND tg_id=$2 AND active=true
       RETURNING id`,
       [room.id, pid]
     );
+    
 
     if(!up.rows.length) {
       await client.query('ROLLBACK');
