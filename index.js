@@ -54,6 +54,7 @@ const boardData = [
   { id: 38, type: 'tax', name: 'Tax', price: 100 },
   { id: 39, type: 'property', name: 'Nike', group: 'dark_blue', price: 400, rent: 50 },
 ];
+
 // тест
 app.get('/', (req, res) => {
   res.send('SERVER OK');
@@ -231,25 +232,29 @@ app.post('/room/:chatId/move', async (req, res) => {
     }
     const newMoney = Number(currentPlayer.money) + bonus;
 
-    // ВИЗНАЧАЄМО НАСТУПНИЙ СТАН ХОДУ
-    const cellInfo = boardData[newPos];
-    let nextState = 'can_end'; // За замовчуванням можна завершувати хід
+    // =========================================================
+    // ТУТ ЗМІНИ ДЛЯ ТЕСТІВ: завжди дозволяємо завершити хід
+    // =========================================================
+    let nextState = 'can_end'; 
 
+    /* === Логіку покупки поки вимкнено ===
+    const cellInfo = boardData[newPos];
     if (cellInfo.type === 'property') {
-      // Перевіряємо, чия це клітинка
       const propRes = await client.query(
         `SELECT owner_id FROM properties WHERE room_id=$1 AND cell_id=$2`, 
         [room.id, newPos]
       );
       
       if (propRes.rows.length === 0 || propRes.rows[0].owner_id === null) {
-        nextState = 'must_buy'; // Нічия -> треба купити або аукціон
+        nextState = 'must_buy'; 
       } else if (propRes.rows[0].owner_id !== currentPlayer.id) {
-        nextState = 'must_pay'; // Чужа -> треба платити оренду
+        nextState = 'must_pay'; 
       }
     } else if (cellInfo.type === 'tax') {
-      nextState = 'must_pay'; // Податок -> треба платити
+      nextState = 'must_pay'; 
     }
+    */
+    // =========================================================
 
     await client.query(
       `UPDATE players SET pos=$1, money=$2 WHERE id=$3`,
