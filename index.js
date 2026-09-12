@@ -17,7 +17,7 @@ const boardData = [
   { id: 1, type: 'property', name: 'Marvel', group: 'media', price: 120, rent: 12 },
   { id: 2, type: 'property', name: 'Pixar', group: 'media', price: 120, rent: 12 },
   { id: 3, type: 'chance', name: 'Task' },
-  { id: 4, type: 'tax', name: 'GiveUser', price: 200 }, 
+  { id: 4, type: 'bonus', name: 'GiveUser', price: 200 }, 
   { id: 5, type: 'property', name: 'Audi', group: 'auto', price: 1000, rent: 50 },
   { id: 6, type: 'property', name: 'Sprite', group: 'drinks', price: 250, rent: 25 },
   { id: 7, type: 'property', name: 'Fanta', group: 'drinks', price: 220, rent: 22 }, 
@@ -134,10 +134,9 @@ app.post('/room/:chatId/move', async (req, res) => {
     const newPos = (oldPos + st) % 40;
     
     let bonus = 0;
-    if (oldPos + st >= 40) bonus = (newPos === 0) ? 2000 : 1000;
-    const newMoney = Number(currentPlayer.money) + bonus;
-
-    // ВМИКАЄМО ЛОГІКУ ПЕРЕВІРКИ ВЛАСНОСТІ!
+    // 1. Бонус за Старт
+    if (oldPos + st >= 40) bonus += (newPos === 0) ? 2000 : 1000;
+    
     const cellInfo = boardData[newPos];
     let nextState = 'can_end'; 
 
@@ -152,7 +151,13 @@ app.post('/room/:chatId/move', async (req, res) => {
       nextState = 'must_pay';
     } else if (cellInfo.type === 'casino') {
       nextState = 'casino_action';
+    } else if (cellInfo.type === 'bonus') {
+      // 2. Якщо стали на БОНУС, додаємо гроші!
+      bonus += cellInfo.price;
+      nextState = 'can_end'; 
     }
+
+    const newMoney = Number(currentPlayer.money) + bonus;
 
     await client.query(`UPDATE players SET pos=$1, money=$2 WHERE id=$3`, [newPos, newMoney, currentPlayer.id]);
     await client.query(`UPDATE rooms SET turn_state=$1, action_cell_id=$2 WHERE id=$3`, [nextState, newPos, room.id]);
