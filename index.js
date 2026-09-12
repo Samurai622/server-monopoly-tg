@@ -228,6 +228,76 @@ app.post('/room/:chatId/skip_buy', async (req, res) => {
   }
 });
 
+// 👉 ОПЛАТА ОРЕНДИ АБО ПОДАТКУ
+app.post('/room/:chatId/pay', async (req, res) => {
+  const { chatId } = req.params;
+  const pid = String(req.body.playerId);
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(
+      `SELECT id, current_turn, turn_state, action_cell_id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, 
+      [chatId]
+    );
+    if (!roomRes.rows.length) throw new Error('Кімнату не знайдено');
+    const room = roomRes.rows[0];
+
+    if (room.turn_state !== 'must_pay') throw new Error('Зараз не потрібно платити');
+
+    const playersRes = await client.query(
+      `SELECT id, tg_id, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, 
+      [room.id]
+    );
+    const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
+    if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
+
+    const cellInfo = boardData[room.action_cell_id];
+    let amountToPay = 0;
+    let receiverId = null;
+
+    if (cellInfo.type === 'tax') {
+      // Якщо це податок (Штраф банку) - платимо фіксовану суму з price
+      amountToPay = cellInfo.price;
+    } else if (cellInfo.type === 'property') {
+      // Якщо це чиясь фірма - шукаємо власника
+      const propRes = await client.query(
+        `SELECT owner_id, level FROM properties WHERE room_id=$1 AND cell_id=$2`, 
+        [room.id, room.action_cell_id]
+      );
+      if (propRes.rows.length > 0) {
+        receiverId = propRes.rows[0].owner_id;
+        
+        // ПОКИ ЩО БЕРЕМО БАЗОВУ ОРЕНДУ (Прокачку додамо наступним кроком)
+        amountToPay = cellInfo.rent; 
+      }
+    }
+
+    if (currentPlayer.money < amountToPay) {
+      throw new Error('Недостатньо грошей для оплати! (Банкрутство скоро буде)');
+    }
+
+    // 1. Списуємо гроші з того, хто наступив
+    await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [amountToPay, currentPlayer.id]);
+
+    // 2. Якщо є власник - зараховуємо гроші йому
+    if (receiverId) {
+      await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [amountToPay, receiverId]);
+    }
+
+    // 3. Дозволяємо завершити хід
+    await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
+
+    await client.query('COMMIT');
+    res.json({ ok: true, amountToPay });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post('/room/:chatId/end_turn', async (req, res) => {
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
