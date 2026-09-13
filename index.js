@@ -11,7 +11,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Оновлені агресивні ціни
 const boardData = [
   { id: 0, type: 'start', name: 'Start' },
   { id: 1, type: 'property', name: 'Marvel', group: 'media', price: 120, rent: 12 },
@@ -61,20 +60,15 @@ app.post('/room/:chatId/join', async (req, res) => {
   const { chatId } = req.params;
   const { id, name } = req.body;
   const tgId = String(id);
-
   const roomRes = await pool.query(`SELECT id, status FROM rooms WHERE chat_id=$1 AND active=true`, [chatId]);
   if (!roomRes.rows.length) return res.status(404).json({ error: 'Room not found or inactive' });
-
   const room = roomRes.rows[0];
   if(room.status !== 'waiting') return res.status(403).json({ error: 'Game already started' });
-
   const countRes = await pool.query(`SELECT COUNT(*) FROM players WHERE room_id=$1 AND active=true`, [room.id]);
   if(+countRes.rows[0].count >= 6) return res.status(403).json({ error: 'Room is full' });
-
   await pool.query(
     `INSERT INTO players (room_id, tg_id, name, pos, money, color, active) VALUES ($1, $2, $3, 0, 1500, $4, true)
-    ON CONFLICT (room_id, tg_id) DO UPDATE SET name = EXCLUDED.name, active = true`,
-    [room.id, tgId, name, randomColor()]
+    ON CONFLICT (room_id, tg_id) DO UPDATE SET name = EXCLUDED.name, active = true`, [room.id, tgId, name, randomColor()]
   );
   res.json({ ok: true });
 });
@@ -85,10 +79,9 @@ app.get('/room/:chatId/state', async (req, res) => {
   if(!roomRes.rows.length) return res.status(404).json({ error: 'GAME_NOT_FOUND' });
   const room = roomRes.rows[0];
 
-  const playersRes = await pool.query(`SELECT tg_id::text AS id, name, pos, money, color, active FROM players WHERE room_id=$1 ORDER BY turn_order NULLS LAST, id`, [room.id]);
+  // ДОДАНО id AS db_id, щоб Фронтенд знав, хто перемагає в Аукціоні!
+  const playersRes = await pool.query(`SELECT id AS db_id, tg_id::text AS id, name, pos, money, color, active FROM players WHERE room_id=$1 ORDER BY turn_order NULLS LAST, id`, [room.id]);
   const activeRes = await pool.query(`SELECT tg_id::text AS id, name FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
-  
-  // Додаємо інформацію про куплені ділянки
   const propsRes = await pool.query(`SELECT cell_id, owner_id FROM properties WHERE room_id=$1`, [room.id]);
 
   let winnerName = null;
@@ -101,7 +94,10 @@ app.get('/room/:chatId/state', async (req, res) => {
   res.json({
     active: room.active, status: room.status, winnerName, currentTurn: room.current_turn,
     currentTurnId, turnState: room.turn_state, actionCellId: room.action_cell_id,
-    players: playersRes.rows, properties: propsRes.rows
+    players: playersRes.rows, properties: propsRes.rows,
+    auctionPrice: room.auction_price,
+    auctionWinnerId: room.auction_winner,
+    auctionPassed: room.auction_passed || []
   });
 });
 
@@ -115,17 +111,14 @@ app.post('/room/:chatId/move', async (req, res) => {
   const { playerId, steps } = req.body;
   const pid = String(playerId);
   const st = Number(steps);
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const roomRes = await client.query(`SELECT id, current_turn, status, turn_state FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
     if (!roomRes.rows.length) throw new Error('Room not found');
     const room = roomRes.rows[0];
-
     if(room.status !== 'playing') throw new Error('Game not in progress');
     if(room.turn_state !== 'waiting_roll') throw new Error('Action required');
-
     const playersRes = await client.query(`SELECT id, tg_id, pos, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
     const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
     if(String(currentPlayer.tg_id) !== pid) throw new Error('Not your turn');
@@ -134,9 +127,7 @@ app.post('/room/:chatId/move', async (req, res) => {
     const newPos = (oldPos + st) % 40;
     
     let bonus = 0;
-    // 1. Бонус за Старт
     if (oldPos + st >= 40) bonus += (newPos === 0) ? 2000 : 1000;
-    
     const cellInfo = boardData[newPos];
     let nextState = 'can_end'; 
 
@@ -152,27 +143,18 @@ app.post('/room/:chatId/move', async (req, res) => {
     } else if (cellInfo.type === 'casino') {
       nextState = 'casino_action';
     } else if (cellInfo.type === 'bonus') {
-      // 2. Якщо стали на БОНУС, додаємо гроші!
       bonus += cellInfo.price;
       nextState = 'can_end'; 
     }
 
     const newMoney = Number(currentPlayer.money) + bonus;
-
     await client.query(`UPDATE players SET pos=$1, money=$2 WHERE id=$3`, [newPos, newMoney, currentPlayer.id]);
     await client.query(`UPDATE rooms SET turn_state=$1, action_cell_id=$2 WHERE id=$3`, [nextState, newPos, room.id]);
-    
     await client.query('COMMIT');
     res.json({ ok: true, bonus });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 КУПІВЛЯ НЕРУХОМОСТІ
 app.post('/room/:chatId/buy', async (req, res) => {
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
@@ -180,127 +162,133 @@ app.post('/room/:chatId/buy', async (req, res) => {
   try {
     await client.query('BEGIN');
     const roomRes = await client.query(`SELECT id, current_turn, turn_state, action_cell_id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
-    if (!roomRes.rows.length) throw new Error('Room not found');
     const room = roomRes.rows[0];
-
     if (room.turn_state !== 'must_buy') throw new Error('Нічого купувати');
+    const playersRes = await client.query(`SELECT id, tg_id, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
+    const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
+    if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
+    const cellInfo = boardData[room.action_cell_id];
+    if (currentPlayer.money < cellInfo.price) throw new Error('Недостатньо коштів');
+    await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [cellInfo.price, currentPlayer.id]);
+    await client.query(`INSERT INTO properties (room_id, cell_id, owner_id) VALUES ($1, $2, $3)`, [room.id, room.action_cell_id, currentPlayer.id]);
+    await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
 
+// 👉 СТАРТ АУКЦІОНУ
+app.post('/room/:chatId/start_auction', async (req, res) => {
+  const { chatId } = req.params;
+  const pid = String(req.body.playerId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id, current_turn, turn_state, action_cell_id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    if (room.turn_state !== 'must_buy') throw new Error('Дія недоступна');
+
+    const playersRes = await client.query(`SELECT id, tg_id FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
+    const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
+    if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
+
+    const cellInfo = boardData[room.action_cell_id];
+    await client.query(`UPDATE rooms SET turn_state='auction', auction_price=$1, auction_winner=NULL, auction_passed='{}' WHERE id=$2`, [cellInfo.price, room.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+// 👉 СТАВКА
+app.post('/room/:chatId/auction_bid', async (req, res) => {
+  const { chatId } = req.params;
+  const pid = String(req.body.playerId);
+  const bidAmount = Number(req.body.amount);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT * FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    if (room.turn_state !== 'auction') throw new Error('Аукціон не активний');
+
+    const playerRes = await client.query(`SELECT id, money FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, pid]);
+    if (!playerRes.rows.length) throw new Error('Ви не у грі');
+    const player = playerRes.rows[0];
+
+    if ((room.auction_passed || []).includes(player.id)) throw new Error('Ви вже вийшли з торгів');
+    if (bidAmount <= room.auction_price) throw new Error('Ставка має бути більшою за поточну');
+    if (bidAmount > player.money) throw new Error('У вас немає стільки грошей');
+
+    await client.query(`UPDATE rooms SET auction_price=$1, auction_winner=$2 WHERE id=$3`, [bidAmount, player.id, room.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+// 👉 ПАС
+app.post('/room/:chatId/auction_pass', async (req, res) => {
+  const { chatId } = req.params;
+  const pid = String(req.body.playerId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT * FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    let room = roomRes.rows[0];
+    if (room.turn_state !== 'auction') throw new Error('Аукціон не активний');
+
+    const playerRes = await client.query(`SELECT id FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, pid]);
+    const playerId = playerRes.rows[0].id;
+    if (room.auction_winner === playerId) throw new Error('Ви лідер торгів, не можна здатися!');
+    
+    let passedList = room.auction_passed || [];
+    if (!passedList.includes(playerId)) {
+      passedList.push(playerId);
+      await client.query(`UPDATE rooms SET auction_passed=$1 WHERE id=$2`, [passedList, room.id]);
+    }
+
+    const activeRes = await client.query(`SELECT COUNT(*) FROM players WHERE room_id=$1 AND active=true`, [room.id]);
+    const activeCount = Number(activeRes.rows[0].count);
+
+    if (passedList.length >= activeCount - 1) {
+      if (room.auction_winner) {
+        await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [room.auction_price, room.auction_winner]);
+        await client.query(`INSERT INTO properties (room_id, cell_id, owner_id) VALUES ($1, $2, $3)`, [room.id, room.action_cell_id, room.auction_winner]);
+      }
+      await client.query(`UPDATE rooms SET turn_state='can_end', auction_winner=NULL, auction_passed='{}', auction_price=0 WHERE id=$1`, [room.id]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+app.post('/room/:chatId/pay', async (req, res) => {
+  const { chatId } = req.params;
+  const pid = String(req.body.playerId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id, current_turn, turn_state, action_cell_id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    if (room.turn_state !== 'must_pay') throw new Error('Зараз не потрібно платити');
     const playersRes = await client.query(`SELECT id, tg_id, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
     const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
     if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
 
     const cellInfo = boardData[room.action_cell_id];
-    if (currentPlayer.money < cellInfo.price) throw new Error('Недостатньо коштів');
+    let amountToPay = 0; let receiverId = null;
 
-    await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [cellInfo.price, currentPlayer.id]);
-    await client.query(`INSERT INTO properties (room_id, cell_id, owner_id) VALUES ($1, $2, $3)`, [room.id, room.action_cell_id, currentPlayer.id]);
-    await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
-
-    await client.query('COMMIT');
-    res.json({ ok: true });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
-});
-
-// 👉 ВІДМОВА ВІД КУПІВЛІ (Пропуск)
-app.post('/room/:chatId/skip_buy', async (req, res) => {
-  const { chatId } = req.params;
-  const pid = String(req.body.playerId);
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const roomRes = await client.query(`SELECT id, current_turn, turn_state FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
-    const room = roomRes.rows[0];
-
-    if (room.turn_state === 'must_buy') {
-      const playersRes = await client.query(`SELECT id, tg_id FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
-      const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
-      if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
-
-      await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
+    if (cellInfo.type === 'tax') amountToPay = cellInfo.price;
+    else if (cellInfo.type === 'property') {
+      const propRes = await client.query(`SELECT owner_id, level FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, room.action_cell_id]);
+      if (propRes.rows.length > 0) { receiverId = propRes.rows[0].owner_id; amountToPay = cellInfo.rent; }
     }
-    await client.query('COMMIT');
-    res.json({ ok: true });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
-});
-
-// 👉 ОПЛАТА ОРЕНДИ АБО ПОДАТКУ
-app.post('/room/:chatId/pay', async (req, res) => {
-  const { chatId } = req.params;
-  const pid = String(req.body.playerId);
-  const client = await pool.connect();
-
-  try {
-    await client.query('BEGIN');
-    const roomRes = await client.query(
-      `SELECT id, current_turn, turn_state, action_cell_id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, 
-      [chatId]
-    );
-    if (!roomRes.rows.length) throw new Error('Кімнату не знайдено');
-    const room = roomRes.rows[0];
-
-    if (room.turn_state !== 'must_pay') throw new Error('Зараз не потрібно платити');
-
-    const playersRes = await client.query(
-      `SELECT id, tg_id, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, 
-      [room.id]
-    );
-    const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
-    if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
-
-    const cellInfo = boardData[room.action_cell_id];
-    let amountToPay = 0;
-    let receiverId = null;
-
-    if (cellInfo.type === 'tax') {
-      // Якщо це податок (Штраф банку) - платимо фіксовану суму з price
-      amountToPay = cellInfo.price;
-    } else if (cellInfo.type === 'property') {
-      // Якщо це чиясь фірма - шукаємо власника
-      const propRes = await client.query(
-        `SELECT owner_id, level FROM properties WHERE room_id=$1 AND cell_id=$2`, 
-        [room.id, room.action_cell_id]
-      );
-      if (propRes.rows.length > 0) {
-        receiverId = propRes.rows[0].owner_id;
-        
-        // ПОКИ ЩО БЕРЕМО БАЗОВУ ОРЕНДУ (Прокачку додамо наступним кроком)
-        amountToPay = cellInfo.rent; 
-      }
-    }
-
-    if (currentPlayer.money < amountToPay) {
-      throw new Error('Недостатньо грошей для оплати! (Банкрутство скоро буде)');
-    }
-
-    // 1. Списуємо гроші з того, хто наступив
+    if (currentPlayer.money < amountToPay) throw new Error('Недостатньо грошей для оплати!');
     await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [amountToPay, currentPlayer.id]);
-
-    // 2. Якщо є власник - зараховуємо гроші йому
-    if (receiverId) {
-      await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [amountToPay, receiverId]);
-    }
-
-    // 3. Дозволяємо завершити хід
+    if (receiverId) await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [amountToPay, receiverId]);
     await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
-
     await client.query('COMMIT');
     res.json({ ok: true, amountToPay });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
 app.post('/room/:chatId/end_turn', async (req, res) => {
@@ -312,63 +300,40 @@ app.post('/room/:chatId/end_turn', async (req, res) => {
     const roomRes = await client.query(`SELECT id, current_turn, turn_state FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
     const room = roomRes.rows[0];
     if (room.turn_state !== 'can_end') throw new Error('Дія не завершена');
-
     const playersRes = await client.query(`SELECT id, tg_id FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
     const turnIndex = room.current_turn % playersRes.rows.length;
-    
     if(String(playersRes.rows[turnIndex].tg_id) !== pid) throw new Error('Не твій хід');
-
     const nextTurn = (turnIndex + 1) % playersRes.rows.length;
     await client.query(`UPDATE rooms SET current_turn=$1, turn_state='waiting_roll', action_cell_id=NULL WHERE id=$2`, [nextTurn, room.id]);
-
     await client.query('COMMIT');
     res.json({ ok: true });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
 app.post('/room/:chatId/surrender', async (req, res) => {
-  // Код здачі залишається без змін (я його зберіг, щоб не розтягувати текст)
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const roomRes = await client.query(`SELECT id, current_turn, status FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
-    if(!roomRes.rows.length) throw new Error('Room not found');
     const room = roomRes.rows[0];
     const playersRes = await client.query(`SELECT id, tg_id FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
-    
     const idx = playersRes.rows.findIndex(p => String(p.tg_id) === pid);
-    if(idx === -1) throw new Error('Player not in game');
-
     await client.query(`UPDATE players SET active=false, money=0 WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, pid]);
-    
     const leftRes = await client.query(`SELECT tg_id FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
     if(leftRes.rows.length <= 1) {
       await client.query(`UPDATE rooms SET status='stopped', active=false WHERE id=$1`, [room.id]);
-      await client.query('COMMIT');
-      return res.json({ ok: true, gameEnded: true });
+      await client.query('COMMIT'); return res.json({ ok: true, gameEnded: true });
     }
-
     let turnIndex = room.current_turn % playersRes.rows.length;
     let newTurn = turnIndex;
     if(idx < turnIndex) newTurn = turnIndex - 1;
     newTurn = newTurn % leftRes.rows.length;
-
     await client.query(`UPDATE rooms SET current_turn=$1 WHERE id=$2`, [newTurn, room.id]);
     await client.query('COMMIT');
     res.json({ ok: true });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
 const PORT = process.env.PORT || 3000;
