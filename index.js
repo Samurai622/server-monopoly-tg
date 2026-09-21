@@ -339,7 +339,7 @@ app.post('/room/:chatId/upgrade', async (req, res) => {
     // ПЕРЕВІРКА ЛІМІТУ
     if (room.has_upgraded_this_turn) throw new Error('Ви вже покращили одну фірму цього ходу!');
 
-    const player = playersRes.find(p => String(p.tg_id) === String(playerId));
+    const player = playersRes.rows.find(p => String(p.tg_id) === String(playerId));
 
     const propRes = await client.query(`SELECT id, is_mortgaged, level FROM properties WHERE room_id=$1 AND cell_id=$2 AND owner_id=$3`, [room.id, cellId, player.id]);
     if (!propRes.rows.length) throw new Error('Це не ваше майно!');
