@@ -321,7 +321,7 @@ app.post('/room/:chatId/pay', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 ПОКРАЩЕННЯ ФІРМИ (Upgrade)
+// 👉 ПОКРАЩЕННЯ ФІРМИ (Upgrade - Рівномірна забудова)
 app.post('/room/:chatId/upgrade', async (req, res) => {
   const { chatId } = req.params;
   const { playerId, cellId } = req.body;
@@ -344,11 +344,16 @@ app.post('/room/:chatId/upgrade', async (req, res) => {
     if (cellInfo.group === 'auto') throw new Error('Автомобілі не покращуються');
 
     const groupCells = boardData.filter(c => c.group === cellInfo.group).map(c => c.id);
-    const ownedProps = await client.query(`SELECT cell_id FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, player.id]);
+    const ownedProps = await client.query(`SELECT cell_id, level FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, player.id]);
     const ownedIds = ownedProps.rows.map(r => r.cell_id);
     const hasMonopoly = groupCells.every(id => ownedIds.includes(id));
     
     if (!hasMonopoly) throw new Error('Спочатку зберіть всі фірми цього кольору!');
+
+    // ПЕРЕВІРКА НА РІВНОМІРНУ ЗАБУДОВУ
+    const groupLevels = ownedProps.rows.filter(r => groupCells.includes(r.cell_id)).map(r => r.level || 0);
+    const minLevel = Math.min(...groupLevels);
+    if (currentLevel > minLevel) throw new Error('Будуйте рівномірно! Спочатку покращіть інші фірми цієї групи.');
 
     const upgradeCost = Math.floor(cellInfo.price * 0.5); 
     if (player.money < upgradeCost) throw new Error(`Не вистачає $${upgradeCost} для покращення!`);
@@ -360,7 +365,7 @@ app.post('/room/:chatId/upgrade', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 ЗНЯТТЯ РІВНЯ (Downgrade - повертає 50% від вартості покращення)
+// 👉 ЗНЯТТЯ РІВНЯ (Downgrade - Рівномірний продаж)
 app.post('/room/:chatId/downgrade', async (req, res) => {
   const { chatId } = req.params;
   const { playerId, cellId } = req.body;
@@ -378,8 +383,15 @@ app.post('/room/:chatId/downgrade', async (req, res) => {
     const currentLevel = propRes.rows[0].level || 0;
     if (currentLevel === 0) throw new Error('Тут немає покращень для продажу!');
 
+    // ПЕРЕВІРКА НА РІВНОМІРНИЙ ПРОДАЖ
     const cellInfo = boardData[cellId];
-    // Апгрейд коштував 50% від ціни фірми. Продаж апгрейду повертає 50% від його вартості.
+    const groupCells = boardData.filter(c => c.group === cellInfo.group).map(c => c.id);
+    const ownedProps = await client.query(`SELECT cell_id, level FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, player.id]);
+    const groupLevels = ownedProps.rows.filter(r => groupCells.includes(r.cell_id)).map(r => r.level || 0);
+    const maxLevel = Math.max(...groupLevels);
+    
+    if (currentLevel < maxLevel) throw new Error('Продавайте рівномірно! Спочатку продайте вищі рівні на сусідніх фірмах.');
+
     const refundAmount = Math.floor((cellInfo.price * 0.5) / 2); 
 
     await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [refundAmount, player.id]);
@@ -451,7 +463,13 @@ app.post('/room/:chatId/mortgage', async (req, res) => {
     if (!propRes.rows.length) throw new Error('Це не ваше майно!');
     if (propRes.rows[0].is_mortgaged) throw new Error('Вже в заставі!');
 
+    // НОВА ПЕРЕВІРКА: Не можна закласти фірму, якщо в цій ГРУПІ є хоч один рівень прокачки
     const cellInfo = boardData[cellId];
+    const groupCells = boardData.filter(c => c.group === cellInfo.group).map(c => c.id);
+    const ownedProps = await client.query(`SELECT cell_id, level FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, player.id]);
+    const groupLevels = ownedProps.rows.filter(r => groupCells.includes(r.cell_id)).map(r => r.level || 0);
+    if (groupLevels.some(lvl => lvl > 0)) throw new Error('Спочатку продайте всі рівні прокачки на ВСІХ фірмах цієї групи!');
+
     const mortgageValue = Math.floor(cellInfo.price / 2);
 
     await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [mortgageValue, player.id]);
@@ -499,11 +517,16 @@ app.post('/room/:chatId/sell_property', async (req, res) => {
     const playerRes = await client.query(`SELECT id FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, String(playerId)]);
     const player = playerRes.rows[0];
 
-    const propRes = await client.query(`SELECT id, level FROM properties WHERE room_id=$1 AND cell_id=$2 AND owner_id=$3`, [room.id, cellId, player.id]);
+    const propRes = await client.query(`SELECT id FROM properties WHERE room_id=$1 AND cell_id=$2 AND owner_id=$3`, [room.id, cellId, player.id]);
     if (!propRes.rows.length) throw new Error('Це не ваше майно!');
-    if (propRes.rows[0].level > 0) throw new Error('Спочатку продайте всі рівні покращення!'); // ПЕРЕВІРКА ТУТ
 
+    // НОВА ПЕРЕВІРКА: Як і в заставі, продати не можна, поки є рівні
     const cellInfo = boardData[cellId];
+    const groupCells = boardData.filter(c => c.group === cellInfo.group).map(c => c.id);
+    const ownedProps = await client.query(`SELECT cell_id, level FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, player.id]);
+    const groupLevels = ownedProps.rows.filter(r => groupCells.includes(r.cell_id)).map(r => r.level || 0);
+    if (groupLevels.some(lvl => lvl > 0)) throw new Error('Спочатку продайте всі рівні прокачки на ВСІХ фірмах цієї групи!');
+
     const sellPrice = Math.floor(cellInfo.price / 2);
 
     await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [sellPrice, player.id]);
