@@ -61,7 +61,7 @@ app.post('/room/:chatId/join', async (req, res) => {
   const { id, name } = req.body;
   const tgId = String(id);
   const roomRes = await pool.query(`SELECT id, status FROM rooms WHERE chat_id=$1 AND active=true`, [chatId]);
-  if (!roomRes.rows.length) return res.status(404).json({ error: 'Room not found or inactive' });
+  if (!roomRes.rows.length) return res.status(404).json({ error: 'Room not found' });
   const room = roomRes.rows[0];
   if(room.status !== 'waiting') return res.status(403).json({ error: 'Game already started' });
   const countRes = await pool.query(`SELECT COUNT(*) FROM players WHERE room_id=$1 AND active=true`, [room.id]);
@@ -78,8 +78,6 @@ app.get('/room/:chatId/state', async (req, res) => {
   const roomRes = await pool.query(`SELECT * FROM rooms WHERE chat_id=$1`, [chatId]);
   if(!roomRes.rows.length) return res.status(404).json({ error: 'GAME_NOT_FOUND' });
   const room = roomRes.rows[0];
-
-  // ДОДАНО id AS db_id, щоб Фронтенд знав, хто перемагає в Аукціоні!
   const playersRes = await pool.query(`SELECT id AS db_id, tg_id::text AS id, name, pos, money, color, active FROM players WHERE room_id=$1 ORDER BY turn_order NULLS LAST, id`, [room.id]);
   const activeRes = await pool.query(`SELECT tg_id::text AS id, name FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
   const propsRes = await pool.query(`SELECT cell_id, owner_id FROM properties WHERE room_id=$1`, [room.id]);
@@ -95,9 +93,7 @@ app.get('/room/:chatId/state', async (req, res) => {
     active: room.active, status: room.status, winnerName, currentTurn: room.current_turn,
     currentTurnId, turnState: room.turn_state, actionCellId: room.action_cell_id,
     players: playersRes.rows, properties: propsRes.rows,
-    auctionPrice: room.auction_price,
-    auctionWinnerId: room.auction_winner,
-    auctionPassed: room.auction_passed || []
+    auctionPrice: room.auction_price, auctionWinnerId: room.auction_winner, auctionPassed: room.auction_passed || []
   });
 });
 
@@ -115,7 +111,6 @@ app.post('/room/:chatId/move', async (req, res) => {
   try {
     await client.query('BEGIN');
     const roomRes = await client.query(`SELECT id, current_turn, status, turn_state FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
-    if (!roomRes.rows.length) throw new Error('Room not found');
     const room = roomRes.rows[0];
     if(room.status !== 'playing') throw new Error('Game not in progress');
     if(room.turn_state !== 'waiting_roll') throw new Error('Action required');
@@ -133,19 +128,11 @@ app.post('/room/:chatId/move', async (req, res) => {
 
     if (cellInfo.type === 'property') {
       const propRes = await client.query(`SELECT owner_id FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, newPos]);
-      if (propRes.rows.length === 0 || propRes.rows[0].owner_id === null) {
-        nextState = 'must_buy'; 
-      } else if (propRes.rows[0].owner_id !== currentPlayer.id) {
-        nextState = 'must_pay'; 
-      }
-    } else if (cellInfo.type === 'tax') {
-      nextState = 'must_pay';
-    } else if (cellInfo.type === 'casino') {
-      nextState = 'casino_action';
-    } else if (cellInfo.type === 'bonus') {
-      bonus += cellInfo.price;
-      nextState = 'can_end'; 
-    }
+      if (propRes.rows.length === 0 || propRes.rows[0].owner_id === null) nextState = 'must_buy'; 
+      else if (propRes.rows[0].owner_id !== currentPlayer.id) nextState = 'must_pay'; 
+    } else if (cellInfo.type === 'tax') nextState = 'must_pay';
+    else if (cellInfo.type === 'casino') nextState = 'casino_action';
+    else if (cellInfo.type === 'bonus') { bonus += cellInfo.price; nextState = 'can_end'; }
 
     const newMoney = Number(currentPlayer.money) + bonus;
     await client.query(`UPDATE players SET pos=$1, money=$2 WHERE id=$3`, [newPos, newMoney, currentPlayer.id]);
@@ -187,19 +174,20 @@ app.post('/room/:chatId/start_auction', async (req, res) => {
     const roomRes = await client.query(`SELECT id, current_turn, turn_state, action_cell_id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
     const room = roomRes.rows[0];
     if (room.turn_state !== 'must_buy') throw new Error('Дія недоступна');
-
     const playersRes = await client.query(`SELECT id, tg_id FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
     const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
     if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
-
     const cellInfo = boardData[room.action_cell_id];
-    await client.query(`UPDATE rooms SET turn_state='auction', auction_price=$1, auction_winner=NULL, auction_passed='{}' WHERE id=$2`, [cellInfo.price, room.id]);
+    
+    // Ініціатор відразу додається до тих, хто пасує
+    const passedArray = [currentPlayer.id]; 
+    await client.query(`UPDATE rooms SET turn_state='auction', auction_price=$1, auction_winner=NULL, auction_passed=$2 WHERE id=$3`, [cellInfo.price, passedArray, room.id]);
     await client.query('COMMIT');
     res.json({ ok: true });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 СТАВКА
+// 👉 СТАВКА / ПОКУПКА
 app.post('/room/:chatId/auction_bid', async (req, res) => {
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
@@ -210,16 +198,28 @@ app.post('/room/:chatId/auction_bid', async (req, res) => {
     const roomRes = await client.query(`SELECT * FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
     const room = roomRes.rows[0];
     if (room.turn_state !== 'auction') throw new Error('Аукціон не активний');
-
     const playerRes = await client.query(`SELECT id, money FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, pid]);
-    if (!playerRes.rows.length) throw new Error('Ви не у грі');
     const player = playerRes.rows[0];
+    const passedList = room.auction_passed || [];
+    
+    if (passedList.includes(player.id)) throw new Error('Ви вже вийшли з торгів');
+    if (room.auction_winner === null) {
+      if (bidAmount < room.auction_price) throw new Error('Ставка не може бути меншою за початкову');
+    } else {
+      if (bidAmount <= room.auction_price) throw new Error('Ставка має бути більшою за поточну');
+    }
+    if (bidAmount > player.money) throw new Error('Недостатньо грошей');
 
-    if ((room.auction_passed || []).includes(player.id)) throw new Error('Ви вже вийшли з торгів');
-    if (bidAmount <= room.auction_price) throw new Error('Ставка має бути більшою за поточну');
-    if (bidAmount > player.money) throw new Error('У вас немає стільки грошей');
+    const activeRes = await client.query(`SELECT COUNT(*) FROM players WHERE room_id=$1 AND active=true`, [room.id]);
+    const activeCount = Number(activeRes.rows[0].count);
 
-    await client.query(`UPDATE rooms SET auction_price=$1, auction_winner=$2 WHERE id=$3`, [bidAmount, player.id, room.id]);
+    if (passedList.length >= activeCount - 1) {
+      await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [bidAmount, player.id]);
+      await client.query(`INSERT INTO properties (room_id, cell_id, owner_id) VALUES ($1, $2, $3)`, [room.id, room.action_cell_id, player.id]);
+      await client.query(`UPDATE rooms SET turn_state='can_end', auction_winner=NULL, auction_passed='{}', auction_price=0 WHERE id=$1`, [room.id]);
+    } else {
+      await client.query(`UPDATE rooms SET auction_price=$1, auction_winner=$2 WHERE id=$3`, [bidAmount, player.id, room.id]);
+    }
     await client.query('COMMIT');
     res.json({ ok: true });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
@@ -235,7 +235,6 @@ app.post('/room/:chatId/auction_pass', async (req, res) => {
     const roomRes = await client.query(`SELECT * FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
     let room = roomRes.rows[0];
     if (room.turn_state !== 'auction') throw new Error('Аукціон не активний');
-
     const playerRes = await client.query(`SELECT id FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, pid]);
     const playerId = playerRes.rows[0].id;
     if (room.auction_winner === playerId) throw new Error('Ви лідер торгів, не можна здатися!');
@@ -273,10 +272,8 @@ app.post('/room/:chatId/pay', async (req, res) => {
     const playersRes = await client.query(`SELECT id, tg_id, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
     const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
     if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
-
     const cellInfo = boardData[room.action_cell_id];
     let amountToPay = 0; let receiverId = null;
-
     if (cellInfo.type === 'tax') amountToPay = cellInfo.price;
     else if (cellInfo.type === 'property') {
       const propRes = await client.query(`SELECT owner_id, level FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, room.action_cell_id]);
