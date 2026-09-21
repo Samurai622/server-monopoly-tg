@@ -80,12 +80,11 @@ app.get('/room/:chatId/state', async (req, res) => {
   const room = roomRes.rows[0];
   const playersRes = await pool.query(`SELECT id AS db_id, tg_id::text AS id, name, pos, money, color, active FROM players WHERE room_id=$1 ORDER BY turn_order NULLS LAST, id`, [room.id]);
   const activeRes = await pool.query(`SELECT tg_id::text AS id, name FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
-  
-  // ДОДАНО: level у вибірку
   const propsRes = await pool.query(`SELECT cell_id, owner_id, is_mortgaged, level FROM properties WHERE room_id=$1`, [room.id]);
 
   let winnerName = null;
   if (room.status === 'stopped' && activeRes.rows.length === 1) winnerName = activeRes.rows[0].name;
+
   const activeCount = activeRes.rows.length;
   const turnIndex = activeCount ? room.current_turn % activeCount : 0;
   const currentTurnId = activeCount ? activeRes.rows[turnIndex]?.id : null;
@@ -94,7 +93,8 @@ app.get('/room/:chatId/state', async (req, res) => {
     active: room.active, status: room.status, winnerName, currentTurn: room.current_turn,
     currentTurnId, turnState: room.turn_state, actionCellId: room.action_cell_id,
     players: playersRes.rows, properties: propsRes.rows,
-    auctionPrice: room.auction_price, auctionWinnerId: room.auction_winner, auctionPassed: room.auction_passed || []
+    auctionPrice: room.auction_price, auctionWinnerId: room.auction_winner, auctionPassed: room.auction_passed || [],
+    hasUpgradedThisTurn: room.has_upgraded_this_turn // НОВЕ ПОЛЕ
   });
 });
 
@@ -328,10 +328,18 @@ app.post('/room/:chatId/upgrade', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const roomRes = await client.query(`SELECT id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const roomRes = await client.query(`SELECT id, current_turn, turn_state, has_upgraded_this_turn FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
     const room = roomRes.rows[0];
-    const playerRes = await client.query(`SELECT id, money FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, String(playerId)]);
-    const player = playerRes.rows[0];
+    
+    // ПЕРЕВІРКА ХОДУ: Чи мій зараз хід?
+    const playersRes = await client.query(`SELECT id, tg_id, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
+    const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
+    if (String(currentPlayer.tg_id) !== String(playerId)) throw new Error('Ви можете будувати тільки під час свого ходу!');
+
+    // ПЕРЕВІРКА ЛІМІТУ
+    if (room.has_upgraded_this_turn) throw new Error('Ви вже покращили одну фірму цього ходу!');
+
+    const player = playersRes.find(p => String(p.tg_id) === String(playerId));
 
     const propRes = await client.query(`SELECT id, is_mortgaged, level FROM properties WHERE room_id=$1 AND cell_id=$2 AND owner_id=$3`, [room.id, cellId, player.id]);
     if (!propRes.rows.length) throw new Error('Це не ваше майно!');
@@ -350,7 +358,6 @@ app.post('/room/:chatId/upgrade', async (req, res) => {
     
     if (!hasMonopoly) throw new Error('Спочатку зберіть всі фірми цього кольору!');
 
-    // ПЕРЕВІРКА НА РІВНОМІРНУ ЗАБУДОВУ
     const groupLevels = ownedProps.rows.filter(r => groupCells.includes(r.cell_id)).map(r => r.level || 0);
     const minLevel = Math.min(...groupLevels);
     if (currentLevel > minLevel) throw new Error('Будуйте рівномірно! Спочатку покращіть інші фірми цієї групи.');
@@ -360,6 +367,9 @@ app.post('/room/:chatId/upgrade', async (req, res) => {
 
     await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [upgradeCost, player.id]);
     await client.query(`UPDATE properties SET level = $1 WHERE id = $2`, [currentLevel + 1, propRes.rows[0].id]);
+    
+    // БЛОКУЄМО ПОДАЛЬШІ АПГРЕЙДИ ЦЬОГО ХОДУ
+    await client.query(`UPDATE rooms SET has_upgraded_this_turn = true WHERE id = $1`, [room.id]);
     
     await client.query('COMMIT'); res.json({ ok: true });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
@@ -401,7 +411,6 @@ app.post('/room/:chatId/downgrade', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-
 app.post('/room/:chatId/end_turn', async (req, res) => {
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
@@ -415,7 +424,12 @@ app.post('/room/:chatId/end_turn', async (req, res) => {
     const turnIndex = room.current_turn % playersRes.rows.length;
     if(String(playersRes.rows[turnIndex].tg_id) !== pid) throw new Error('Не твій хід');
     const nextTurn = (turnIndex + 1) % playersRes.rows.length;
-    await client.query(`UPDATE rooms SET current_turn=$1, turn_state='waiting_roll', action_cell_id=NULL WHERE id=$2`, [nextTurn, room.id]);
+    
+    // ЗМІНА ТУТ: Скидаємо has_upgraded_this_turn на false
+    await client.query(
+      `UPDATE rooms SET current_turn=$1, turn_state='waiting_roll', action_cell_id=NULL, has_upgraded_this_turn=false WHERE id=$2`, 
+      [nextTurn, room.id]
+    );
     await client.query('COMMIT');
     res.json({ ok: true });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
