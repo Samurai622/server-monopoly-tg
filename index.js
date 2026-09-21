@@ -81,8 +81,8 @@ app.get('/room/:chatId/state', async (req, res) => {
   const playersRes = await pool.query(`SELECT id AS db_id, tg_id::text AS id, name, pos, money, color, active FROM players WHERE room_id=$1 ORDER BY turn_order NULLS LAST, id`, [room.id]);
   const activeRes = await pool.query(`SELECT tg_id::text AS id, name FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
   
-  // ВАЖЛИВО: Тепер ми беремо ще й is_mortgaged
-  const propsRes = await pool.query(`SELECT cell_id, owner_id, is_mortgaged FROM properties WHERE room_id=$1`, [room.id]);
+  // ДОДАНО: level у вибірку
+  const propsRes = await pool.query(`SELECT cell_id, owner_id, is_mortgaged, level FROM properties WHERE room_id=$1`, [room.id]);
 
   let winnerName = null;
   if (room.status === 'stopped' && activeRes.rows.length === 1) winnerName = activeRes.rows[0].name;
@@ -128,17 +128,12 @@ app.post('/room/:chatId/move', async (req, res) => {
     let nextState = 'can_end'; 
 
     if (cellInfo.type === 'property') {
-      // Перевіряємо статус застави
       const propRes = await client.query(`SELECT owner_id, is_mortgaged FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, newPos]);
       if (propRes.rows.length === 0 || propRes.rows[0].owner_id === null) {
         nextState = 'must_buy'; 
       } else if (propRes.rows[0].owner_id !== currentPlayer.id) {
-        // ЯКЩО ФІРМА В ЗАСТАВІ - ОРЕНДА НЕ ПЛАТИТЬСЯ (Можна завершити хід)
-        if (propRes.rows[0].is_mortgaged) {
-          nextState = 'can_end';
-        } else {
-          nextState = 'must_pay'; 
-        }
+        if (propRes.rows[0].is_mortgaged) nextState = 'can_end';
+        else nextState = 'must_pay'; 
       }
     } else if (cellInfo.type === 'tax') nextState = 'must_pay';
     else if (cellInfo.type === 'casino') nextState = 'casino_action';
@@ -174,7 +169,6 @@ app.post('/room/:chatId/buy', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 СТАРТ АУКЦІОНУ
 app.post('/room/:chatId/start_auction', async (req, res) => {
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
@@ -189,7 +183,6 @@ app.post('/room/:chatId/start_auction', async (req, res) => {
     if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
     const cellInfo = boardData[room.action_cell_id];
     
-    // Ініціатор відразу додається до тих, хто пасує
     const passedArray = [currentPlayer.id]; 
     await client.query(`UPDATE rooms SET turn_state='auction', auction_price=$1, auction_winner=NULL, auction_passed=$2 WHERE id=$3`, [cellInfo.price, passedArray, room.id]);
     await client.query('COMMIT');
@@ -197,7 +190,6 @@ app.post('/room/:chatId/start_auction', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 СТАВКА / ПОКУПКА
 app.post('/room/:chatId/auction_bid', async (req, res) => {
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
@@ -235,7 +227,6 @@ app.post('/room/:chatId/auction_bid', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 ПАС
 app.post('/room/:chatId/auction_pass', async (req, res) => {
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
@@ -270,6 +261,7 @@ app.post('/room/:chatId/auction_pass', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
+// 👉 ОПЛАТА ОРЕНДИ (ОНОВЛЕНО: рахує монополію та зірочки!)
 app.post('/room/:chatId/pay', async (req, res) => {
   const { chatId } = req.params;
   const pid = String(req.body.playerId);
@@ -286,10 +278,37 @@ app.post('/room/:chatId/pay', async (req, res) => {
     const cellInfo = boardData[room.action_cell_id];
     let amountToPay = 0; let receiverId = null;
 
-    if (cellInfo.type === 'tax') amountToPay = cellInfo.price;
-    else if (cellInfo.type === 'property') {
-      const propRes = await client.query(`SELECT owner_id FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, room.action_cell_id]);
-      if (propRes.rows.length > 0) { receiverId = propRes.rows[0].owner_id; amountToPay = cellInfo.rent; }
+    if (cellInfo.type === 'tax') {
+      amountToPay = cellInfo.price;
+    } else if (cellInfo.type === 'property') {
+      // З бази дістаємо власника, заставу і РІВЕНЬ
+      const propRes = await client.query(`SELECT owner_id, is_mortgaged, level FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, room.action_cell_id]);
+      if (propRes.rows.length > 0 && !propRes.rows[0].is_mortgaged) { 
+        receiverId = propRes.rows[0].owner_id; 
+        const lvl = propRes.rows[0].level || 0;
+        
+        if (cellInfo.group === 'auto') {
+          // Машини: рахуємо скільки машин у власника
+          const autoRes = await client.query(`SELECT COUNT(*) FROM properties p JOIN rooms r ON p.room_id=r.id WHERE r.id=$1 AND p.owner_id=$2 AND p.cell_id IN (5,15,25,35)`, [room.id, receiverId]);
+          const count = Number(autoRes.rows[0].count);
+          const multipliers = [0, 1, 2, 4, 8];
+          amountToPay = cellInfo.rent * multipliers[count];
+        } else {
+          // Звичайні фірми
+          if (lvl === 0) {
+            // Перевіряємо монополію (х2)
+            const groupCells = boardData.filter(c => c.group === cellInfo.group).map(c => c.id);
+            const ownedProps = await client.query(`SELECT cell_id FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, receiverId]);
+            const ownedIds = ownedProps.rows.map(r => r.cell_id);
+            const hasMonopoly = groupCells.every(id => ownedIds.includes(id));
+            amountToPay = hasMonopoly ? cellInfo.rent * 2 : cellInfo.rent;
+          } else if (lvl === 1) amountToPay = cellInfo.rent * 3;
+          else if (lvl === 2) amountToPay = cellInfo.rent * 8;
+          else if (lvl === 3) amountToPay = cellInfo.rent * 15;
+          else if (lvl === 4) amountToPay = cellInfo.rent * 25;
+          else if (lvl === 5) amountToPay = cellInfo.rent * 40;
+        }
+      }
     }
     
     if (currentPlayer.money < amountToPay) throw new Error(`Не вистачає $${amountToPay - currentPlayer.money}! Закладіть фірми, продайте їх або здайтеся.`);
@@ -299,6 +318,45 @@ app.post('/room/:chatId/pay', async (req, res) => {
     await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
     await client.query('COMMIT');
     res.json({ ok: true, amountToPay });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+// 👉 НОВИЙ РОУТ: ПОКРАЩЕННЯ (UPGRADE)
+app.post('/room/:chatId/upgrade', async (req, res) => {
+  const { chatId } = req.params;
+  const { playerId, cellId } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    const playerRes = await client.query(`SELECT id, money FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, String(playerId)]);
+    const player = playerRes.rows[0];
+
+    const propRes = await client.query(`SELECT id, is_mortgaged, level FROM properties WHERE room_id=$1 AND cell_id=$2 AND owner_id=$3`, [room.id, cellId, player.id]);
+    if (!propRes.rows.length) throw new Error('Це не ваше майно!');
+    if (propRes.rows[0].is_mortgaged) throw new Error('Фірма в заставі!');
+
+    const currentLevel = propRes.rows[0].level || 0;
+    if (currentLevel >= 5) throw new Error('Досягнуто максимальний рівень!');
+
+    const cellInfo = boardData[cellId];
+    if (cellInfo.group === 'auto') throw new Error('Автомобілі не покращуються');
+
+    const groupCells = boardData.filter(c => c.group === cellInfo.group).map(c => c.id);
+    const ownedProps = await client.query(`SELECT cell_id FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, player.id]);
+    const ownedIds = ownedProps.rows.map(r => r.cell_id);
+    const hasMonopoly = groupCells.every(id => ownedIds.includes(id));
+    
+    if (!hasMonopoly) throw new Error('Спочатку зберіть всі фірми цього кольору!');
+
+    const upgradeCost = Math.floor(cellInfo.price * 0.5); 
+    if (player.money < upgradeCost) throw new Error(`Не вистачає $${upgradeCost} для покращення!`);
+
+    await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [upgradeCost, player.id]);
+    await client.query(`UPDATE properties SET level = $1 WHERE id = $2`, [currentLevel + 1, propRes.rows[0].id]);
+    
+    await client.query('COMMIT'); res.json({ ok: true });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
@@ -371,7 +429,6 @@ app.post('/room/:chatId/mortgage', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 ВИКУП ІЗ ЗАСТАВИ
 app.post('/room/:chatId/unmortgage', async (req, res) => {
   const { chatId } = req.params;
   const { playerId, cellId } = req.body;
@@ -388,7 +445,7 @@ app.post('/room/:chatId/unmortgage', async (req, res) => {
     if (!propRes.rows[0].is_mortgaged) throw new Error('Не в заставі!');
 
     const cellInfo = boardData[cellId];
-    const unmortgageCost = Math.floor((cellInfo.price / 2) * 1.1); // 50% + 10% комісії
+    const unmortgageCost = Math.floor((cellInfo.price / 2) * 1.1);
 
     if (player.money < unmortgageCost) throw new Error(`Потрібно $${unmortgageCost} для викупу`);
 
@@ -398,7 +455,6 @@ app.post('/room/:chatId/unmortgage', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
-// 👉 ПРОДАЖ БАНКУ (Остаточний)
 app.post('/room/:chatId/sell_property', async (req, res) => {
   const { chatId } = req.params;
   const { playerId, cellId } = req.body;
