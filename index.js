@@ -80,11 +80,12 @@ app.get('/room/:chatId/state', async (req, res) => {
   const room = roomRes.rows[0];
   const playersRes = await pool.query(`SELECT id AS db_id, tg_id::text AS id, name, pos, money, color, active FROM players WHERE room_id=$1 ORDER BY turn_order NULLS LAST, id`, [room.id]);
   const activeRes = await pool.query(`SELECT tg_id::text AS id, name FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
-  const propsRes = await pool.query(`SELECT cell_id, owner_id FROM properties WHERE room_id=$1`, [room.id]);
+  
+  // ВАЖЛИВО: Тепер ми беремо ще й is_mortgaged
+  const propsRes = await pool.query(`SELECT cell_id, owner_id, is_mortgaged FROM properties WHERE room_id=$1`, [room.id]);
 
   let winnerName = null;
   if (room.status === 'stopped' && activeRes.rows.length === 1) winnerName = activeRes.rows[0].name;
-
   const activeCount = activeRes.rows.length;
   const turnIndex = activeCount ? room.current_turn % activeCount : 0;
   const currentTurnId = activeCount ? activeRes.rows[turnIndex]?.id : null;
@@ -120,16 +121,25 @@ app.post('/room/:chatId/move', async (req, res) => {
 
     const oldPos = Number(currentPlayer.pos);
     const newPos = (oldPos + st) % 40;
-    
     let bonus = 0;
     if (oldPos + st >= 40) bonus += (newPos === 0) ? 2000 : 1000;
+    
     const cellInfo = boardData[newPos];
     let nextState = 'can_end'; 
 
     if (cellInfo.type === 'property') {
-      const propRes = await client.query(`SELECT owner_id FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, newPos]);
-      if (propRes.rows.length === 0 || propRes.rows[0].owner_id === null) nextState = 'must_buy'; 
-      else if (propRes.rows[0].owner_id !== currentPlayer.id) nextState = 'must_pay'; 
+      // Перевіряємо статус застави
+      const propRes = await client.query(`SELECT owner_id, is_mortgaged FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, newPos]);
+      if (propRes.rows.length === 0 || propRes.rows[0].owner_id === null) {
+        nextState = 'must_buy'; 
+      } else if (propRes.rows[0].owner_id !== currentPlayer.id) {
+        // ЯКЩО ФІРМА В ЗАСТАВІ - ОРЕНДА НЕ ПЛАТИТЬСЯ (Можна завершити хід)
+        if (propRes.rows[0].is_mortgaged) {
+          nextState = 'can_end';
+        } else {
+          nextState = 'must_pay'; 
+        }
+      }
     } else if (cellInfo.type === 'tax') nextState = 'must_pay';
     else if (cellInfo.type === 'casino') nextState = 'casino_action';
     else if (cellInfo.type === 'bonus') { bonus += cellInfo.price; nextState = 'can_end'; }
@@ -272,14 +282,18 @@ app.post('/room/:chatId/pay', async (req, res) => {
     const playersRes = await client.query(`SELECT id, tg_id, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
     const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
     if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
+
     const cellInfo = boardData[room.action_cell_id];
     let amountToPay = 0; let receiverId = null;
+
     if (cellInfo.type === 'tax') amountToPay = cellInfo.price;
     else if (cellInfo.type === 'property') {
-      const propRes = await client.query(`SELECT owner_id, level FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, room.action_cell_id]);
+      const propRes = await client.query(`SELECT owner_id FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, room.action_cell_id]);
       if (propRes.rows.length > 0) { receiverId = propRes.rows[0].owner_id; amountToPay = cellInfo.rent; }
     }
-    if (currentPlayer.money < amountToPay) throw new Error('Недостатньо грошей для оплати!');
+    
+    if (currentPlayer.money < amountToPay) throw new Error(`Не вистачає $${amountToPay - currentPlayer.money}! Закладіть фірми, продайте їх або здайтеся.`);
+
     await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [amountToPay, currentPlayer.id]);
     if (receiverId) await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [amountToPay, receiverId]);
     await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
@@ -330,6 +344,81 @@ app.post('/room/:chatId/surrender', async (req, res) => {
     await client.query(`UPDATE rooms SET current_turn=$1 WHERE id=$2`, [newTurn, room.id]);
     await client.query('COMMIT');
     res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+app.post('/room/:chatId/mortgage', async (req, res) => {
+  const { chatId } = req.params;
+  const { playerId, cellId } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    const playerRes = await client.query(`SELECT id FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, String(playerId)]);
+    const player = playerRes.rows[0];
+
+    const propRes = await client.query(`SELECT id, is_mortgaged FROM properties WHERE room_id=$1 AND cell_id=$2 AND owner_id=$3`, [room.id, cellId, player.id]);
+    if (!propRes.rows.length) throw new Error('Це не ваше майно!');
+    if (propRes.rows[0].is_mortgaged) throw new Error('Вже в заставі!');
+
+    const cellInfo = boardData[cellId];
+    const mortgageValue = Math.floor(cellInfo.price / 2);
+
+    await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [mortgageValue, player.id]);
+    await client.query(`UPDATE properties SET is_mortgaged = true WHERE id = $1`, [propRes.rows[0].id]);
+    await client.query('COMMIT'); res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+// 👉 ВИКУП ІЗ ЗАСТАВИ
+app.post('/room/:chatId/unmortgage', async (req, res) => {
+  const { chatId } = req.params;
+  const { playerId, cellId } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    const playerRes = await client.query(`SELECT id, money FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, String(playerId)]);
+    const player = playerRes.rows[0];
+
+    const propRes = await client.query(`SELECT id, is_mortgaged FROM properties WHERE room_id=$1 AND cell_id=$2 AND owner_id=$3`, [room.id, cellId, player.id]);
+    if (!propRes.rows.length) throw new Error('Це не ваше майно!');
+    if (!propRes.rows[0].is_mortgaged) throw new Error('Не в заставі!');
+
+    const cellInfo = boardData[cellId];
+    const unmortgageCost = Math.floor((cellInfo.price / 2) * 1.1); // 50% + 10% комісії
+
+    if (player.money < unmortgageCost) throw new Error(`Потрібно $${unmortgageCost} для викупу`);
+
+    await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [unmortgageCost, player.id]);
+    await client.query(`UPDATE properties SET is_mortgaged = false WHERE id = $1`, [propRes.rows[0].id]);
+    await client.query('COMMIT'); res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+// 👉 ПРОДАЖ БАНКУ (Остаточний)
+app.post('/room/:chatId/sell_property', async (req, res) => {
+  const { chatId } = req.params;
+  const { playerId, cellId } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    const playerRes = await client.query(`SELECT id FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, String(playerId)]);
+    const player = playerRes.rows[0];
+
+    const propRes = await client.query(`SELECT id FROM properties WHERE room_id=$1 AND cell_id=$2 AND owner_id=$3`, [room.id, cellId, player.id]);
+    if (!propRes.rows.length) throw new Error('Це не ваше майно!');
+
+    const cellInfo = boardData[cellId];
+    const sellPrice = Math.floor(cellInfo.price / 2);
+
+    await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [sellPrice, player.id]);
+    await client.query(`DELETE FROM properties WHERE id = $1`, [propRes.rows[0].id]);
+    await client.query('COMMIT'); res.json({ ok: true });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
