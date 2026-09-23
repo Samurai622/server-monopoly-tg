@@ -54,6 +54,17 @@ const boardData = [
   { id: 39, type: 'property', name: 'Adidas', group: 'cloths', price: 400, rent: 40 }
 ];
 
+const chanceCards = [
+  { text: "Помилка банку на вашу користь! Отримайте $300.", action: 'money', value: 300 },
+  { text: "Штраф за перевищення швидкості. Сплатіть $150.", action: 'money', value: -150 },
+  { text: "Ви виграли в лотерею! Отримайте $500.", action: 'money', value: 500 },
+  { text: "Оплата податків. Сплатіть $200.", action: 'money', value: -200 },
+  { text: "Ви знайшли на вулиці гаманець. Отримайте $100.", action: 'money', value: 100 },
+  { text: "Рахунок від лікаря. Сплатіть $100.", action: 'money', value: -100 },
+  { text: "Термінове відрядження! Вас переміщено на Старт (отримайте $2000).", action: 'move', value: 0 },
+  { text: "Ремонт майна! Сплатіть $50 за КОЖЕН рівень покращення на ваших фірмах.", action: 'tax_per_level', value: -50 }
+];
+
 app.get('/', (req, res) => res.send('SERVER OK'));
 
 app.post('/room/:chatId/join', async (req, res) => {
@@ -115,17 +126,20 @@ app.post('/room/:chatId/move', async (req, res) => {
     const room = roomRes.rows[0];
     if(room.status !== 'playing') throw new Error('Game not in progress');
     if(room.turn_state !== 'waiting_roll') throw new Error('Action required');
+    
     const playersRes = await client.query(`SELECT id, tg_id, pos, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
     const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
     if(String(currentPlayer.tg_id) !== pid) throw new Error('Not your turn');
 
     const oldPos = Number(currentPlayer.pos);
-    const newPos = (oldPos + st) % 40;
+    let newPos = (oldPos + st) % 40; // ЗМІНИЛИ НА let, бо Шанс може нас перемістити
+    
     let bonus = 0;
     if (oldPos + st >= 40) bonus += (newPos === 0) ? 2000 : 1000;
     
     const cellInfo = boardData[newPos];
     let nextState = 'can_end'; 
+    let taskText = null; // Для відправки на фронтенд
 
     if (cellInfo.type === 'property') {
       const propRes = await client.query(`SELECT owner_id, is_mortgaged FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, newPos]);
@@ -135,15 +149,38 @@ app.post('/room/:chatId/move', async (req, res) => {
         if (propRes.rows[0].is_mortgaged) nextState = 'can_end';
         else nextState = 'must_pay'; 
       }
-    } else if (cellInfo.type === 'tax') nextState = 'must_pay';
-    else if (cellInfo.type === 'casino') nextState = 'casino_action';
-    else if (cellInfo.type === 'bonus') { bonus += cellInfo.price; nextState = 'can_end'; }
+    } else if (cellInfo.type === 'tax') {
+      nextState = 'must_pay';
+    } else if (cellInfo.type === 'casino') {
+      nextState = 'casino_action';
+    } else if (cellInfo.type === 'bonus') {
+      bonus += cellInfo.price;
+      nextState = 'can_end'; 
+    } else if (cellInfo.type === 'chance') {
+      // === ЛОГІКА КАРТКИ "ШАНС" ===
+      const randomCard = chanceCards[Math.floor(Math.random() * chanceCards.length)];
+      taskText = randomCard.text;
+
+      if (randomCard.action === 'money') {
+        bonus += randomCard.value;
+      } else if (randomCard.action === 'move') {
+        newPos = randomCard.value;
+        if (newPos === 0) bonus += 2000; // Бонус за потрапляння на Старт
+      } else if (randomCard.action === 'tax_per_level') {
+        const props = await client.query(`SELECT level FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, currentPlayer.id]);
+        let totalLevels = props.rows.reduce((sum, p) => sum + (p.level || 0), 0);
+        bonus += (totalLevels * randomCard.value);
+      }
+      nextState = 'can_end';
+    }
 
     const newMoney = Number(currentPlayer.money) + bonus;
     await client.query(`UPDATE players SET pos=$1, money=$2 WHERE id=$3`, [newPos, newMoney, currentPlayer.id]);
     await client.query(`UPDATE rooms SET turn_state=$1, action_cell_id=$2 WHERE id=$3`, [nextState, newPos, room.id]);
     await client.query('COMMIT');
-    res.json({ ok: true, bonus });
+    
+    // ВІДПРАВЛЯЄМО taskText на фронтенд
+    res.json({ ok: true, bonus, taskText });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
