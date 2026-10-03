@@ -633,5 +633,77 @@ app.post('/room/:chatId/sell_property', async (req, res) => {
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
+// 👉 ЗІГРАТИ В КАЗИНО (1 кубик)
+app.post('/room/:chatId/play_casino', async (req, res) => {
+  const { chatId } = req.params;
+  const { playerId, betAmount, betType } = req.body;
+  const pid = String(playerId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id, current_turn, turn_state FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    if (room.turn_state !== 'casino_action') throw new Error('Зараз не час для казино!');
+
+    const playersRes = await client.query(`SELECT id, tg_id, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
+    const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
+    
+    if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід!');
+    if (betAmount <= 0) throw new Error('Ставка має бути більшою за 0!');
+    if (currentPlayer.money < betAmount) throw new Error('Недостатньо грошей для такої ставки!');
+
+    // КИДАЄМО 1 КУБИК (від 1 до 6)
+    const roll = Math.floor(Math.random() * 6) + 1;
+    let winAmount = 0;
+    let resultMsg = `🎲 Випало: ${roll}.\n`;
+
+    // ПЕРЕВІРКА ВИГРАШУ
+    if (betType === 'even' && roll % 2 === 0) {
+      winAmount = betAmount * 2;
+    } else if (betType === 'odd' && roll % 2 !== 0) {
+      winAmount = betAmount * 2;
+    } else if (String(roll) === String(betType)) {
+      winAmount = betAmount * 5; // Вгадав точне число!
+    }
+
+    let moneyChange = 0;
+    if (winAmount > 0) {
+      moneyChange = winAmount - betAmount; // Чистий прибуток
+      resultMsg += `🎉 Ви виграли $${winAmount}!`;
+    } else {
+      moneyChange = -betAmount; // Програш
+      resultMsg += `❌ Ви програли $${betAmount}.`;
+    }
+
+    // Оновлюємо баланс і дозволяємо завершити хід
+    await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [moneyChange, currentPlayer.id]);
+    await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
+
+    await client.query('COMMIT');
+    res.json({ ok: true, resultMsg });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+// 👉 ВІДМОВИТИСЬ ВІД КАЗИНО
+app.post('/room/:chatId/skip_casino', async (req, res) => {
+  const { chatId } = req.params;
+  const pid = String(req.body.playerId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id, current_turn, turn_state FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    if (room.turn_state !== 'casino_action') throw new Error('Зараз не час для казино!');
+
+    const playersRes = await client.query(`SELECT id, tg_id FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
+    const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
+    if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід!');
+
+    await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
