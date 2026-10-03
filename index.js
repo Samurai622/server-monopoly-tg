@@ -89,7 +89,8 @@ app.get('/room/:chatId/state', async (req, res) => {
   const roomRes = await pool.query(`SELECT * FROM rooms WHERE chat_id=$1`, [chatId]);
   if(!roomRes.rows.length) return res.status(404).json({ error: 'GAME_NOT_FOUND' });
   const room = roomRes.rows[0];
-  const playersRes = await pool.query(`SELECT id AS db_id, tg_id::text AS id, name, pos, money, color, active FROM players WHERE room_id=$1 ORDER BY turn_order NULLS LAST, id`, [room.id]);
+  
+  const playersRes = await pool.query(`SELECT id AS db_id, tg_id::text AS id, name, pos, money, color, active, jail_turns FROM players WHERE room_id=$1 ORDER BY turn_order NULLS LAST, id`, [room.id]);
   const activeRes = await pool.query(`SELECT tg_id::text AS id, name FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id`, [room.id]);
   const propsRes = await pool.query(`SELECT cell_id, owner_id, is_mortgaged, level FROM properties WHERE room_id=$1`, [room.id]);
 
@@ -105,7 +106,7 @@ app.get('/room/:chatId/state', async (req, res) => {
     currentTurnId, turnState: room.turn_state, actionCellId: room.action_cell_id,
     players: playersRes.rows, properties: propsRes.rows,
     auctionPrice: room.auction_price, auctionWinnerId: room.auction_winner, auctionPassed: room.auction_passed || [],
-    hasUpgradedThisTurn: room.has_upgraded_this_turn // НОВЕ ПОЛЕ
+    hasUpgradedThisTurn: room.has_upgraded_this_turn 
   });
 });
 
@@ -116,9 +117,11 @@ function randomColor() {
 
 app.post('/room/:chatId/move', async (req, res) => {
   const { chatId } = req.params;
-  const { playerId, steps } = req.body;
+  const { playerId, d1, d2 } = req.body; // Фронтенд тепер має передавати 2 кубика окремо
   const pid = String(playerId);
-  const st = Number(steps);
+  const st = Number(d1) + Number(d2);
+  const isDouble = (Number(d1) === Number(d2));
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -127,20 +130,51 @@ app.post('/room/:chatId/move', async (req, res) => {
     if(room.status !== 'playing') throw new Error('Game not in progress');
     if(room.turn_state !== 'waiting_roll') throw new Error('Action required');
     
-    const playersRes = await client.query(`SELECT id, tg_id, pos, money FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
+    // Додали jail_turns
+    const playersRes = await client.query(`SELECT id, tg_id, pos, money, jail_turns FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
     const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
     if(String(currentPlayer.tg_id) !== pid) throw new Error('Not your turn');
 
-    const oldPos = Number(currentPlayer.pos);
-    let newPos = (oldPos + st) % 40; // ЗМІНИЛИ НА let, бо Шанс може нас перемістити
-    
-    let bonus = 0;
-    if (oldPos + st >= 40) bonus += (newPos === 0) ? 2000 : 1000;
-    
-    const cellInfo = boardData[newPos];
-    let nextState = 'can_end'; 
-    let taskText = null; // Для відправки на фронтенд
+    // === ЛОГІКА В'ЯЗНИЦІ (СИДИТЬ В КАМЕРІ) ===
+    if (currentPlayer.jail_turns > 0) {
+      if (isDouble) {
+        // ВИПАВ ДАБЛ! Гравець вільний, але його хід ЗАВЕРШУЄТЬСЯ
+        await client.query(`UPDATE players SET jail_turns = 0 WHERE id=$1`, [currentPlayer.id]);
+        await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
+        await client.query('COMMIT');
+        return res.json({ ok: true, isDouble: true, taskText: "Випав Дабл! Ви на свободі! Завершіть хід." });
+      } else {
+        // НЕ ДАБЛ
+        let nextJailTurn = currentPlayer.jail_turns + 1;
+        if (nextJailTurn > 3) {
+          // Якщо це була 3-тя помилка, він вже не може кидати кубики, мусить платити
+          await client.query('COMMIT');
+          return res.status(400).json({ error: "Всі спроби вичерпано. Ви мусите заплатити $50!" });
+        } else {
+          // Просто збільшуємо лічильник спроб і віддаємо хід наступному
+          await client.query(`UPDATE players SET jail_turns = $1 WHERE id=$2`, [nextJailTurn, currentPlayer.id]);
+          await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
+          await client.query('COMMIT');
+          return res.json({ ok: true, taskText: `Невдала спроба. Залишилось: ${4 - nextJailTurn}` });
+        }
+      }
+    }
 
+    // === ЗВИЧАЙНИЙ РУХ ===
+    const oldPos = Number(currentPlayer.pos);
+    let newPos = (oldPos + st) % 40; 
+    let bonus = 0;
+    let nextState = 'can_end'; 
+    let taskText = null; 
+
+    // Якщо не попав прямо у в'язницю (№30), даємо бонус за коло
+    if (oldPos + st >= 40 && newPos !== 30) {
+      bonus += (newPos === 0) ? 2000 : 1000;
+    }
+
+    const cellInfo = boardData[newPos];
+
+    // ПЕРЕВІРКА КЛІТИНОК
     if (cellInfo.type === 'property') {
       const propRes = await client.query(`SELECT owner_id, is_mortgaged FROM properties WHERE room_id=$1 AND cell_id=$2`, [room.id, newPos]);
       if (propRes.rows.length === 0 || propRes.rows[0].owner_id === null) {
@@ -155,23 +189,24 @@ app.post('/room/:chatId/move', async (req, res) => {
       nextState = 'casino_action';
     } else if (cellInfo.type === 'bonus') {
       bonus += cellInfo.price;
-      nextState = 'can_end'; 
     } else if (cellInfo.type === 'chance') {
-      // === ЛОГІКА КАРТКИ "ШАНС" ===
       const randomCard = chanceCards[Math.floor(Math.random() * chanceCards.length)];
       taskText = randomCard.text;
-
-      if (randomCard.action === 'money') {
-        bonus += randomCard.value;
-      } else if (randomCard.action === 'move') {
+      if (randomCard.action === 'money') bonus += randomCard.value;
+      else if (randomCard.action === 'move') {
         newPos = randomCard.value;
-        if (newPos === 0) bonus += 2000; // Бонус за потрапляння на Старт
+        if (newPos === 0) bonus += 2000; 
       } else if (randomCard.action === 'tax_per_level') {
         const props = await client.query(`SELECT level FROM properties WHERE room_id=$1 AND owner_id=$2`, [room.id, currentPlayer.id]);
         let totalLevels = props.rows.reduce((sum, p) => sum + (p.level || 0), 0);
         bonus += (totalLevels * randomCard.value);
       }
-      nextState = 'can_end';
+    } else if (cellInfo.type === 'go_jail') {
+      // === ПІЙМАЛИ І ВІДПРАВИЛИ У В'ЯЗНИЦЮ ===
+      newPos = 20; // Клітинка Jail
+      bonus = 0;   // Бонуси скасовуються
+      await client.query(`UPDATE players SET jail_turns = 1 WHERE id=$1`, [currentPlayer.id]);
+      taskText = "👮 Ви відправилися до В'язниці!";
     }
 
     const newMoney = Number(currentPlayer.money) + bonus;
@@ -179,8 +214,30 @@ app.post('/room/:chatId/move', async (req, res) => {
     await client.query(`UPDATE rooms SET turn_state=$1, action_cell_id=$2 WHERE id=$3`, [nextState, newPos, room.id]);
     await client.query('COMMIT');
     
-    // ВІДПРАВЛЯЄМО taskText на фронтенд
     res.json({ ok: true, bonus, taskText });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+app.post('/room/:chatId/pay_bail', async (req, res) => {
+  const { chatId } = req.params;
+  const pid = String(req.body.playerId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id, current_turn FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    const playersRes = await client.query(`SELECT id, tg_id, money, jail_turns FROM players WHERE room_id=$1 AND active=true ORDER BY turn_order NULLS LAST, id FOR UPDATE`, [room.id]);
+    const currentPlayer = playersRes.rows[room.current_turn % playersRes.rows.length];
+    
+    if (String(currentPlayer.tg_id) !== pid) throw new Error('Не твій хід');
+    if (currentPlayer.jail_turns === 0) throw new Error('Ви не у в\'язниці!');
+    if (currentPlayer.money < 50) throw new Error('Не вистачає $50! Закладіть або продайте фірми.');
+
+    // Знімаємо гроші і ставимо jail_turns = 0 (вільний!)
+    await client.query(`UPDATE players SET money = money - 50, jail_turns = 0 WHERE id = $1`, [currentPlayer.id]);
+    
+    await client.query('COMMIT');
+    res.json({ ok: true, msg: "Заставу оплачено. Кидайте кубики!" });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
