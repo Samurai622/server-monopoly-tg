@@ -215,6 +215,13 @@ app.post('/room/:chatId/move', async (req, res) => {
     await client.query(`UPDATE rooms SET turn_state=$1, action_cell_id=$2 WHERE id=$3`, [nextState, newPos, room.id]);
     
     await appendLog(client, room.id, `🎲 ${currentPlayer.name} викинув ${st} і став на ${cellInfo.name}`);
+
+    if (cellInfo.type === 'chance' && taskText) {
+      await appendLog(client, room.id, `❓ Шанс: ${taskText}`);
+    } else if (cellInfo.type === 'bonus') {
+      await appendLog(client, room.id, `🎁 ${currentPlayer.name} отримав бонус $${cellInfo.price}!`);
+    }
+
     await client.query('COMMIT');
     
     res.json({ ok: true, bonus, taskText });
