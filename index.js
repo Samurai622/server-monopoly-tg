@@ -106,7 +106,8 @@ app.get('/room/:chatId/state', async (req, res) => {
     currentTurnId, turnState: room.turn_state, actionCellId: room.action_cell_id,
     players: playersRes.rows, properties: propsRes.rows,
     auctionPrice: room.auction_price, auctionWinnerId: room.auction_winner, auctionPassed: room.auction_passed || [],
-    hasUpgradedThisTurn: room.has_upgraded_this_turn 
+    hasUpgradedThisTurn: room.has_upgraded_this_turn,
+    pendingTrade: room.pending_trade
   });
 });
 
@@ -702,6 +703,90 @@ app.post('/room/:chatId/skip_casino', async (req, res) => {
     await client.query(`UPDATE rooms SET turn_state='can_end' WHERE id=$1`, [room.id]);
     await client.query('COMMIT');
     res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+// 👉 ЗАПРОПОНУВАТИ ОБМІН
+app.post('/room/:chatId/propose_trade', async (req, res) => {
+  const { chatId } = req.params;
+  const { senderId, receiverDbId, offerProps, offerMoney, requestProps, requestMoney } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id, pending_trade FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    if (room.pending_trade) throw new Error('Вже є активна пропозиція обміну!');
+
+    const senderRes = await client.query(`SELECT id, money FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, String(senderId)]);
+    const sender = senderRes.rows[0];
+
+    if (offerMoney > sender.money) throw new Error('У вас немає стільки грошей для доплати!');
+
+    const tradeData = {
+      senderDbId: sender.id,
+      receiverDbId: Number(receiverDbId),
+      offerProps: offerProps || [],
+      offerMoney: Number(offerMoney) || 0,
+      requestProps: requestProps || [],
+      requestMoney: Number(requestMoney) || 0
+    };
+
+    await client.query(`UPDATE rooms SET pending_trade = $1 WHERE id = $2`, [JSON.stringify(tradeData), room.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+});
+
+// 👉 ВІДПОВІДЬ НА ОБМІН (Прийняти / Відхилити)
+app.post('/room/:chatId/respond_trade', async (req, res) => {
+  const { chatId } = req.params;
+  const { playerId, accept } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const roomRes = await client.query(`SELECT id, pending_trade FROM rooms WHERE chat_id=$1 AND active=true FOR UPDATE`, [chatId]);
+    const room = roomRes.rows[0];
+    if (!room.pending_trade) throw new Error('Немає активної пропозиції');
+
+    const trade = room.pending_trade;
+    const playerRes = await client.query(`SELECT id, money FROM players WHERE room_id=$1 AND tg_id=$2 AND active=true`, [room.id, String(playerId)]);
+    const player = playerRes.rows[0];
+
+    if (player.id !== trade.receiverDbId) throw new Error('Ця пропозиція не для вас');
+
+    if (!accept) {
+      // Відхилено
+      await client.query(`UPDATE rooms SET pending_trade = NULL WHERE id = $1`, [room.id]);
+      await client.query('COMMIT');
+      return res.json({ ok: true, msg: "Угоду відхилено." });
+    }
+
+    // Прийнято: перевіряємо чи є гроші у отримувача (якщо з нього вимагали гроші)
+    if (trade.requestMoney > player.money) throw new Error('У вас недостатньо коштів для цієї угоди!');
+
+    const senderRes = await client.query(`SELECT id, money FROM players WHERE id=$1`, [trade.senderDbId]);
+    const sender = senderRes.rows[0];
+    if (trade.offerMoney > sender.money) throw new Error('У автора угоди більше немає грошей для доплати!');
+
+    // 1. ПЕРЕДАЧА ГРОШЕЙ
+    const netSenderMoney = trade.requestMoney - trade.offerMoney;
+    await client.query(`UPDATE players SET money = money + $1 WHERE id = $2`, [netSenderMoney, sender.id]);
+    await client.query(`UPDATE players SET money = money - $1 WHERE id = $2`, [netSenderMoney, player.id]);
+
+    // 2. ПЕРЕДАЧА ФІРМ ВІД ВІДПРАВНИКА ДО ОТРИМУВАЧА
+    for (const cellId of trade.offerProps) {
+      await client.query(`UPDATE properties SET owner_id = $1 WHERE room_id = $2 AND cell_id = $3`, [player.id, room.id, cellId]);
+    }
+
+    // 3. ПЕРЕДАЧА ФІРМ ВІД ОТРИМУВАЧА ДО ВІДПРАВНИКА
+    for (const cellId of trade.requestProps) {
+      await client.query(`UPDATE properties SET owner_id = $1 WHERE room_id = $2 AND cell_id = $3`, [sender.id, room.id, cellId]);
+    }
+
+    // Очищаємо статус угоди
+    await client.query(`UPDATE rooms SET pending_trade = NULL WHERE id = $1`, [room.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true, msg: "Угода успішно укладена!" });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
